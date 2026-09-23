@@ -165,6 +165,7 @@ impl MacroInput {
                 let has_substates = !state.substates.is_empty();
                 if is_concrete {
                     let synthetic_state_def = StateDefinition {
+                        background_cost: state_def.background_cost,
                         state: state.clone(),
                         transient: state_def.transient,
                         state_shortname: state_def.state_shortname.clone(),
@@ -184,6 +185,7 @@ impl MacroInput {
                     }
                 } else if is_fully_generic {
                     let synthetic_state_def = StateDefinition {
+                        background_cost: state_def.background_cost,
                         state: state.clone(),
                         transient: state_def.transient,
                         state_shortname: state_def.state_shortname.clone(),
@@ -284,6 +286,12 @@ impl Parse for MacroInput {
                 )
             })?;
 
+        if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+        }
+        if !input.is_empty() {
+            return Err(input.error("cost checks belong on API functions: use #[abacus_cost(PeripheralCost)] outside process_register_block"));
+        }
         Ok(MacroInput {
             peripheral_name: peripheral_name.value(),
             state_definitions: state_definitions.into_iter().collect(),

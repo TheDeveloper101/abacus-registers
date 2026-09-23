@@ -71,6 +71,7 @@ pub struct State {
 /// Struct to store parsed state definition.
 #[derive(Clone, Debug)]
 pub struct StateDefinition {
+    pub background_cost: Option<crate::concrete::model::Cost>,
     pub state: State,
     pub transient: bool,
     pub state_shortname: syn::Ident,
@@ -160,32 +161,32 @@ impl Parse for StateDefinition {
             state.state_name.clone()
         };
 
-        // Optional *T* transient marker in the remaining parenthesized content.
         let mut transient = false;
-        if state_definition.parse::<syn::Token![,]>().is_ok() {
-            let _: syn::Token![*] = state_definition.parse().map_err(|e| {
-                syn::Error::new(e.span(), "Expected * at start of transient marker *T*. Should be of the form `(State, *T*)`")
-            })?;
-            let t_ident: Ident = state_definition.parse().map_err(|e| {
-                syn::Error::new(e.span(), "Expected 'T' in transient marker *T*. Should be of the form `(State, *T*)`")
-            })?;
-
-            if t_ident.to_string() != "T" {
-                return Err(syn::Error::new(
-                    t_ident.span(),
-                    format!("Transient marker is invalid. Expected *T*, instead found: {}", t_ident),
-                ));
+        let mut background_cost = None;
+        while !state_definition.is_empty() {
+            state_definition.parse::<syn::Token![,]>()?;
+            if state_definition.peek(syn::Token![*]) {
+                state_definition.parse::<syn::Token![*]>()?;
+                let marker: Ident = state_definition.parse()?;
+                if marker != "T" || transient {
+                    return Err(syn::Error::new(
+                        marker.span(),
+                        "expected a single *T* transient marker",
+                    ));
+                }
+                state_definition.parse::<syn::Token![*]>()?;
+                transient = true;
+            } else {
+                let key: Ident = state_definition.parse()?;
+                if key != "cost" || background_cost.is_some() {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "expected a single cost = value",
+                    ));
+                }
+                state_definition.parse::<syn::Token![=]>()?;
+                background_cost = Some(state_definition.parse()?);
             }
-            let _: syn::Token![*] = state_definition.parse().map_err(|_| syn::Error::new(state_definition.span(), "Error Parsing transient marker *T*. Should be of the form `(State, *T*)`"))?;
-            transient = true;
-        }
-
-        // Check if anything else is left in the state definition
-        if !state_definition.is_empty() {
-            return Err(syn::Error::new(
-                state_definition.span(),
-                format!("Transient marker *T* must be followed by nothing else. Instead found tokens: {}", state_definition),
-            ));
         }
 
         // Reject trailing tokens that aren't a comma (next item in states list).
@@ -197,6 +198,7 @@ impl Parse for StateDefinition {
         }
 
         Ok(StateDefinition {
+            background_cost,
             state,
             transient,
             state_shortname,
@@ -215,6 +217,16 @@ pub enum RegisterType {
 }
 
 impl RegisterType {
+    /// Shared by register code generation and the concrete checker.
+    pub fn state_change_method(&self) -> Option<Ident> {
+        match self {
+            Self::StateChange(state, _, shortname) => Some(format_ident!(
+                "into_{}",
+                shortname.as_ref().unwrap_or(&state.state_name).to_string().to_lowercase()
+            )),
+            _ => None,
+        }
+    }
     pub fn to_ident(&self) -> Ident {
         match self {
             RegisterType::ReadOnly => format_ident!("ReadOnly"),
@@ -287,6 +299,7 @@ impl Parse for RegisterType {
 }
 
 pub struct RegisterAttributes {
+    pub cost: Option<crate::concrete::model::Cost>,
     pub valid_states: Punctuated<State, syn::Token![,]>,
     pub register_type: RegisterType,
 }
@@ -304,6 +317,9 @@ impl Parse for RegisterAttributes {
                 )
             })?;
 
+        if valid_states.is_empty() {
+            return Err(input.error("register attributes require at least one valid state"));
+        }
         input.parse::<syn::Token![,]>().map_err(|_| {
             syn::Error::new(
                 input.span(),
@@ -317,7 +333,22 @@ impl Parse for RegisterAttributes {
             )
         })?;
 
+        let cost = if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            let key: Ident = input.parse()?;
+            if key != "cost" {
+                return Err(syn::Error::new(key.span(), "expected cost = value"));
+            }
+            input.parse::<syn::Token![=]>()?;
+            Some(input.parse()?)
+        } else {
+            None
+        };
+        if !input.is_empty() {
+            return Err(input.error("unexpected register attribute tokens"));
+        }
         Ok(RegisterAttributes {
+            cost,
             valid_states,
             register_type,
         })
@@ -587,8 +618,8 @@ mod tests {
     }
 
     #[test]
-    fn test_register_type_state_change_rw() {
-        let reg_type = RegisterType::StateChangeRW;
+    fn test_register_type_state_change_ident() {
+        let reg_type: RegisterType = parse_quote!(StateChange(Active, [ENABLE::SET]));
         assert_eq!(reg_type.to_ident().to_string(), "StateChange");
     }
 

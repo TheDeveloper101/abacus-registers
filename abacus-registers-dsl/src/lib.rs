@@ -21,6 +21,7 @@
 //!
 //!
 
+mod concrete;
 mod generating;
 mod macro_input;
 mod parsing;
@@ -36,9 +37,20 @@ use crate::generating::generate_state_enum;
 use crate::macro_input::MacroInput;
 use crate::register::Register;
 
+#[doc = include_str!("../CONCRETE_CHECKER.md")]
 #[proc_macro_attribute]
 pub fn process_register_block(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed_input = parse_macro_input!(attr as MacroInput);
+    let ast = parse_macro_input!(item as DeriveInput);
+    expand_register_block(parsed_input, ast)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn expand_register_block(
+    parsed_input: MacroInput,
+    ast: DeriveInput,
+) -> syn::Result<proc_macro2::TokenStream> {
     let register = format_ident!("{}Registers", parsed_input.peripheral_name);
     let internal_register = format_ident!("Block");
     let state_enum_ident = format_ident!("{}StateEnum", parsed_input.peripheral_name);
@@ -54,14 +66,18 @@ pub fn process_register_block(attr: TokenStream, item: TokenStream) -> TokenStre
     let (states_generated, _) = parsed_input.generate_states(&register, &state_enum_ident);
     result.extend(states_generated);
 
-    let ast: DeriveInput =
-        syn::parse(item).expect("Abacus Macro - Error Parsing Provided AST of register struct.");
     let data = match &ast.data {
         syn::Data::Struct(data) => data,
-        _ => panic!("Abacus Macro - Unsupported type; must be a struct."),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &ast,
+                "Abacus requires a register block struct",
+            ));
+        }
     };
 
-    let (field_details, reg_vec) = process_struct_fields(&data.fields);
+    let (field_details, reg_vec) = process_struct_fields(&data.fields)?;
+    result.extend(concrete::metadata(&parsed_input, &ast));
     result.extend(generate_register_bindings(&reg_vec, &register));
     result.extend(register_type_definitions());
     result.extend(quote! {
@@ -71,12 +87,14 @@ pub fn process_register_block(attr: TokenStream, item: TokenStream) -> TokenStre
         }
     });
 
-    result.into()
+    Ok(result)
 }
 
 fn add_imports() -> proc_macro2::TokenStream {
     quote!(
-        use abacus_registers::{State, SubState, StateEnum, Reg, SyncState, TransientStateReg, AbacusStaticRef};
+        use abacus_registers::{
+            State, SubState, StateEnum, Reg, SyncState, TransientStateReg, AbacusStaticRef,
+        };
         use core::marker::PhantomData;
         use core::mem::transmute;
         use core::ops::Deref;
@@ -113,20 +131,22 @@ fn generate_register_wrapper(
     }
 }
 
-fn process_struct_fields(fields: &syn::Fields) -> (Vec<proc_macro2::TokenStream>, Vec<Register>) {
+fn process_struct_fields(
+    fields: &syn::Fields,
+) -> syn::Result<(Vec<proc_macro2::TokenStream>, Vec<Register>)> {
     let mut reg_vec = Vec::new();
     let field_details: Vec<_> = fields
         .iter()
         .map(|field| {
-            let (tokens, mut registers) = process_field(field);
+            let (tokens, mut registers) = process_field(field)?;
             reg_vec.append(&mut registers);
-            tokens
+            Ok(tokens)
         })
-        .collect();
-    (field_details, reg_vec)
+        .collect::<syn::Result<Vec<_>>>()?;
+    Ok((field_details, reg_vec))
 }
 
-fn process_field(field: &Field) -> (proc_macro2::TokenStream, Vec<Register>) {
+fn process_field(field: &Field) -> syn::Result<(proc_macro2::TokenStream, Vec<Register>)> {
     let field_type = field.ty.clone();
     let field_name = field
         .ident
@@ -151,23 +171,18 @@ fn process_field(field: &Field) -> (proc_macro2::TokenStream, Vec<Register>) {
         .collect();
 
     if !requires_gen {
-        return (
+        return Ok((
             quote! { #(#field_attr)* pub #field_name: #field_type },
             vec![],
-        );
+        ));
     }
 
     let reg_attr_vec: Vec<_> = field
         .attrs
         .iter()
-        .filter_map(|attr| {
-            if attr.path().is_ident("RegAttributes") {
-                attr.parse_args::<parsing::RegisterAttributes>().ok()
-            } else {
-                None
-            }
-        })
-        .collect();
+        .filter(|attr| attr.path().is_ident("RegAttributes"))
+        .map(|attr| attr.parse_args::<parsing::RegisterAttributes>())
+        .collect::<syn::Result<_>>()?;
 
     let Type::Path(type_path) = field_type.clone() else {
         panic!("unreachable b");
@@ -208,6 +223,7 @@ fn process_field(field: &Field) -> (proc_macro2::TokenStream, Vec<Register>) {
 
     for reg_attr in reg_attr_vec {
         registers.push(Register {
+            cost: reg_attr.cost,
             name: field_name.clone(),
             valid_states: reg_attr.valid_states,
             register_shortname: register_shortname.clone(),
@@ -231,7 +247,7 @@ fn process_field(field: &Field) -> (proc_macro2::TokenStream, Vec<Register>) {
         output
     };
 
-    (output, registers)
+    Ok((output, registers))
 }
 
 fn generate_register_bindings(
@@ -283,19 +299,36 @@ fn register_type_definitions() -> proc_macro2::TokenStream {
             associated_state: PhantomData<S>,
         }
 
-        struct ReadWriteRegister<T: UIntLike, R: RegisterLongName, S: State> {
+        pub struct ReadWriteRegister<T: UIntLike, R: RegisterLongName, S: State> {
             reg: ReadWrite<T, R>,
             associated_state: PhantomData<S>,
         }
 
-        struct ReadOnlyRegister<T: UIntLike, R: RegisterLongName, S: State> {
+        pub struct ReadOnlyRegister<T: UIntLike, R: RegisterLongName, S: State> {
             reg: ReadOnly<T, R>,
             associated_state: PhantomData<S>,
         }
 
-        struct WriteOnlyRegister<T: UIntLike, R: RegisterLongName, S: State> {
+        pub struct WriteOnlyRegister<T: UIntLike, R: RegisterLongName, S: State> {
             reg: WriteOnly<T, R>,
             associated_state: PhantomData<S>,
         }
     }
+}
+
+/// Check ordinary Rust peripheral API functions using generated cost metadata.
+#[proc_macro_attribute]
+pub fn abacus_cost(attr: TokenStream, item: TokenStream) -> TokenStream {
+    concrete::api::start(attr.into(), item.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Internal metadata callback used by generated peripheral cost macros.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __abacus_cost(input: TokenStream) -> TokenStream {
+    concrete::api::expand(input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }

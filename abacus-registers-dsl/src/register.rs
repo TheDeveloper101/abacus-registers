@@ -5,7 +5,9 @@ use syn::{punctuated::Punctuated, Ident};
 use crate::parsing::{RegisterType, State};
 use std::collections::HashSet;
 
+#[derive(Clone)]
 pub struct Register {
+    pub cost: Option<crate::concrete::model::Cost>,
     pub name: Ident,
     pub valid_states: Punctuated<State, syn::Token![,]>,
     pub register_shortname: syn::GenericArgument,
@@ -17,6 +19,13 @@ impl Register {
     /// Create passthrough for valid tock-register operations for each
     /// AbacusRegister type.
     pub fn generate_register_op_bindings(&self, register_name: &Ident) -> proc_macro2::TokenStream {
+        if !matches!(self.register_type, RegisterType::StateChange(..)) && self.valid_states.len() > 1 {
+            return self.valid_states.iter().flat_map(|state| {
+                let mut binding = self.clone();
+                binding.valid_states = std::iter::once(state.clone()).collect();
+                binding.generate_register_op_bindings(register_name)
+            }).collect();
+        }
         let register_bitwidth = self.register_bitwidth.clone();
         let register_shortname = self.register_shortname.clone();
         let validstate = self
@@ -80,8 +89,6 @@ impl Register {
             )
         };
 
-        // FIXME: This only accounts for the first state. We need to account for all states.in the
-        // valid states. StateChangeRegister currently does this, but all register types should.
         match &self.register_type {
             RegisterType::ReadOnly => {
                 if is_anytype {
@@ -248,8 +255,7 @@ impl Register {
                 let method_shortname = shortname.as_ref().unwrap_or(&state.state_name);
                 let trait_name = format_ident!("Step{}", method_shortname);
 
-                let to_state_fn_name =
-                    format_ident!("into_{}", method_shortname.to_string().to_lowercase());
+                let to_state_fn_name = self.register_type.state_change_method().unwrap();
 
                 if is_anytype {
                     // Create copy of state to change
@@ -267,7 +273,7 @@ impl Register {
                     };
 
                     state_change_output.extend(quote! {
-                        trait #trait_name<#carrot_block>: Sized
+                        pub trait #trait_name<#carrot_block>: Sized
                         where
                             #to_state: State,
                             S: State,
@@ -326,7 +332,7 @@ impl Register {
                     let to_state = state.form_concrete_state_type();
 
                     state_change_output.extend(quote! {
-                        trait #trait_name<S: State>: Sized
+                        pub trait #trait_name<S: State>: Sized
                         where
                             #register_name<S>: Reg
                         {

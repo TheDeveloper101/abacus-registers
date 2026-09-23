@@ -99,3 +99,14 @@ within a closure.
 
 (see [this branch](https://github.com/abacus-rs/tock/blob/master/chips/nrf5x/src/temperature.rs) for the full 
 example shown above)
+
+## Peripheral API cost checking
+
+Add `cost = ...` to existing state declarations and `RegAttributes`, then put
+`#[abacus_cost(PeripheralCost)]` on the actual Rust API function, inherent impl,
+or inline module using those generated registers. The generated metadata provider
+uses the peripheral name, e.g. `SensorCost` for `peripheral_name = "Sensor"`.
+The checker prints a single numeric cost bound per function during compilation.
+
+No `checks` section, separate analysis body, resource selector, or cost constant
+is needed. See the [API checking example and supported Rust subset](abacus-registers-dsl/CONCRETE_CHECKER.md).
