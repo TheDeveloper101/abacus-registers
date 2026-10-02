@@ -29,7 +29,7 @@ impl MacroInput {
         &self,
         register_name: &Ident,
         state_enum_name: &Ident,
-    ) -> (proc_macro2::TokenStream, HashMap<String, State>) {
+    ) -> syn::Result<(proc_macro2::TokenStream, HashMap<String, State>)> {
         let mut output = proc_macro2::TokenStream::new();
 
         // The other state hashes include the substates. This is strictly
@@ -54,7 +54,10 @@ impl MacroInput {
                 } else if state.substates.len() == 2 {
                     output.extend(quote! {});
                 } else {
-                    unimplemented!("Only 2 substates are supported.");
+                    return Err(syn::Error::new(
+                        state.state_name.span(),
+                        "only two substates are supported",
+                    ));
                 }
 
                 strict_state_hash.insert(state.state_name.to_string());
@@ -168,6 +171,7 @@ impl MacroInput {
                         state: state.clone(),
                         transient: state_def.transient,
                         state_shortname: state_def.state_shortname.clone(),
+                        cost: state_def.cost,
                     };
                     if has_substates {
                         output.extend(generating::generate_state_conversion_impls_only(
@@ -187,6 +191,7 @@ impl MacroInput {
                         state: state.clone(),
                         transient: state_def.transient,
                         state_shortname: state_def.state_shortname.clone(),
+                        cost: state_def.cost,
                     };
                     output.extend(generating::generate_state_trait_impls_only(
                         &synthetic_state_def,
@@ -208,7 +213,7 @@ impl MacroInput {
             });
         }
 
-        (output, state_map)
+        Ok((output, state_map))
     }
 }
 
@@ -230,6 +235,12 @@ impl Parse for MacroInput {
             syn::Error::new(
                 input.span(),
                 "Abacus Macro - Expected string literal for peripheral_name",
+            )
+        })?;
+        syn::parse_str::<Ident>(&peripheral_name.value()).map_err(|_| {
+            syn::Error::new(
+                peripheral_name.span(),
+                "peripheral_name must be a Rust identifier",
             )
         })?;
         let _: syn::Token![,] = input.parse().map_err(|_| {
@@ -284,6 +295,9 @@ impl Parse for MacroInput {
                 )
             })?;
 
+        if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+        }
         Ok(MacroInput {
             peripheral_name: peripheral_name.value(),
             state_definitions: state_definitions.into_iter().collect(),

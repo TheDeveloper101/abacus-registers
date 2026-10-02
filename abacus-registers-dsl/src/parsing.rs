@@ -1,17 +1,17 @@
 //! Parsing logic for the Abacus Macro.
-//! 
-//! This handles the parsing of the Abacus DSL and converts it into a 
+//!
+//! This handles the parsing of the Abacus DSL and converts it into a
 //! objects that can be used for code generation.
-//! 
+//!
 //! Valid Input of the form (w/o substates):
-//! 
+//!
 //! ```Rust
 //! #[process_register_block(
 //!     peripheral_name = "Nrf5xTemp",
 //!     register_base_addr = 0x4000C000,
 //!     states = [
-//!         (Off),
-//!         (Reading, *T*),
+//!         (Off, cost: 1),
+//!         (Reading, *T*, cost: 5),
 //!     ]
 //! )]
 //! struct TemperatureRegisters {
@@ -25,16 +25,16 @@
 //!     pub task_stop: WriteOnly<u32, Task::Register>,
 //! }
 //! ```
-//! 
+//!
 //! Valid Input of the form (w/ substates):
-//! 
+//!
 //! ```Rust
 //! #[process_register_block(
 //!     peripheral_name = "Nrf52Uart,
 //!     register_base_addr = 0x4000C000,
 //!     states = [
-//!         (Off),
-//!         (Reading(Tx, Rx), *T*),
+//!         (Off, cost: 1),
+//!         (Reading(Tx, Rx), ReadingBoth, *T*, cost: 5),
 //!     ]
 //! )]
 //! struct TemperatureRegisters {
@@ -44,8 +44,8 @@
 //!     pub task_stop: WriteOnly<u32, Task::Register>,
 //! }
 //! ```
-//! 
-//! The DSL consists of two primary annotations: 
+//!
+//! The DSL consists of two primary annotations:
 //!   - Top level to specify the states, substates, shortname (that is used for states w/ substates)
 //!     and whether a given state is a transient state.
 //!   - `RegAttributes` to specify stateful constraints for a given register.
@@ -56,7 +56,7 @@ use syn::{
     bracketed,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
-    Ident,
+    Ident, LitInt,
 };
 
 /// Helper struct for parsing macro input (Abacus DSL) and
@@ -67,13 +67,13 @@ pub struct State {
     pub substates: Punctuated<syn::Ident, syn::Token![,]>,
 }
 
-
 /// Struct to store parsed state definition.
 #[derive(Clone, Debug)]
 pub struct StateDefinition {
     pub state: State,
     pub transient: bool,
     pub state_shortname: syn::Ident,
+    pub cost: usize,
 }
 
 impl Parse for State {
@@ -82,10 +82,13 @@ impl Parse for State {
         // State
         // State(SubState)
         // State(SubState1, SubState2, .., SubStateN)
-        let state_name: Ident = input.parse()
-            .map_err(|_| syn::Error::new(input.span(), 
-            "State Parsing declaration missing. Valid states are one of \
-            the following:`State`, `State(SubState)`, `State(SubState1, SubState2, .., SubStateN)`"))?;
+        let state_name: Ident = input.parse().map_err(|_| {
+            syn::Error::new(
+                input.span(),
+                "State Parsing declaration missing. Valid states are one of \
+            the following:`State`, `State(SubState)`, `State(SubState1, SubState2, .., SubStateN)`",
+            )
+        })?;
 
         // Check for substates - of the form State(SubState, ..., SubStateN)
         let substates = if input.peek(syn::token::Paren) {
@@ -93,7 +96,7 @@ impl Parse for State {
             let _: syn::token::Paren = syn::parenthesized!(substate_def in input);
             let substates: Punctuated<Ident, syn::Token![,]> = substate_def
                 .parse_terminated(syn::Ident::parse, syn::Token![,])
-                .map_err(|_| syn::Error::new(substate_def.span(), 
+                .map_err(|_| syn::Error::new(substate_def.span(),
                 "SubState Parsing declaration invalid. Valid state/substates \
                 are one of the following: `State(SubState)`, `State(SubState1, SubState2, .., SubStateN)`"))?;
             Some(substates)
@@ -101,10 +104,12 @@ impl Parse for State {
         .unwrap_or_else(|| Punctuated::new());
 
         if substates.len() > 2 {
-            return Err(syn::Error::new(input.span(), 
-            "Only 2 substates are supported for now. \
+            return Err(syn::Error::new(
+                input.span(),
+                "Only 2 substates are supported for now. \
             Please file an issue at https://github.com/abacus-rs/abacus-registers/issues \
-            if your use case requires more than 2 substates."));
+            if your use case requires more than 2 substates.",
+            ));
         }
 
         Ok(State {
@@ -123,14 +128,17 @@ impl Parse for StateDefinition {
         // - (State(SubState1, ..., SubStateN), shortname) - state with substates, shortname required
         // - (State, *T*) - transient state
         // - (State(SubState1, ..., SubStateN), shortname, *T*) - transient state with substates
+        // after the state is defined, there is also a cost parameter that needs to be specified
 
-        // Confirm that the state definition is parenthesized, give more descriptive 
-        // error if not. This is required since `parenthesized!` macro does not give 
+        // Confirm that the state definition is parenthesized, give more descriptive
+        // error if not. This is required since `parenthesized!` macro does not give
         // adequetly descriptive error messages.
         if !input.peek(syn::token::Paren) {
-            return Err(syn::Error::new(input.span(), 
-            "State Definition Parsing, state definition must be parenthesized. \
-            Should be of the form `(State, shortname, *T*)`"));
+            return Err(syn::Error::new(
+                input.span(),
+                "State Definition Parsing, state definition must be parenthesized. \
+            Should be of the form `(State, shortname, *T*, cost: num)`",
+            ));
         }
 
         let state_definition;
@@ -146,7 +154,7 @@ impl Parse for StateDefinition {
             // States with SubState must provide a "shortname" of the form
             // (State(Substates...), shortname).
             let _: syn::token::Comma = state_definition.parse()
-                .map_err(|_| syn::Error::new(state_definition.span(), 
+                .map_err(|_| syn::Error::new(state_definition.span(),
                 "State Definition Parsing, no comma between state(substate1, ..., substateN) /
                 and shortname. Should be of the form `(State(SubState1, ..., SubState2), shortname)`"))?;
 
@@ -160,31 +168,34 @@ impl Parse for StateDefinition {
             state.state_name.clone()
         };
 
-        // Optional *T* transient marker in the remaining parenthesized content.
-        let mut transient = false;
-        if state_definition.parse::<syn::Token![,]>().is_ok() {
-            let _: syn::Token![*] = state_definition.parse().map_err(|e| {
-                syn::Error::new(e.span(), "Expected * at start of transient marker *T*. Should be of the form `(State, *T*)`")
-            })?;
-            let t_ident: Ident = state_definition.parse().map_err(|e| {
-                syn::Error::new(e.span(), "Expected 'T' in transient marker *T*. Should be of the form `(State, *T*)`")
-            })?;
-
-            if t_ident.to_string() != "T" {
-                return Err(syn::Error::new(
-                    t_ident.span(),
-                    format!("Transient marker is invalid. Expected *T*, instead found: {}", t_ident),
-                ));
+        state_definition.parse::<syn::Token![,]>()?;
+        let transient = if state_definition.peek(syn::Token![*]) {
+            state_definition.parse::<syn::Token![*]>()?;
+            let marker: Ident = state_definition.parse()?;
+            if marker != "T" {
+                return Err(syn::Error::new(marker.span(), "expected *T*"));
             }
-            let _: syn::Token![*] = state_definition.parse().map_err(|_| syn::Error::new(state_definition.span(), "Error Parsing transient marker *T*. Should be of the form `(State, *T*)`"))?;
-            transient = true;
+            state_definition.parse::<syn::Token![*]>()?;
+            state_definition.parse::<syn::Token![,]>()?;
+            true
+        } else {
+            false
+        };
+        let keyword: Ident = state_definition.parse()?;
+        if keyword != "cost" {
+            return Err(syn::Error::new(keyword.span(), "expected cost: number"));
         }
+        state_definition.parse::<syn::Token![:]>()?;
+        let cost = state_definition.parse::<LitInt>()?.base10_parse()?;
 
         // Check if anything else is left in the state definition
         if !state_definition.is_empty() {
             return Err(syn::Error::new(
                 state_definition.span(),
-                format!("Transient marker *T* must be followed by nothing else. Instead found tokens: {}", state_definition),
+                format!(
+                    "Cost definition must be followed by nothing else. Instead found tokens: {}",
+                    state_definition
+                ),
             ));
         }
 
@@ -200,6 +211,7 @@ impl Parse for StateDefinition {
             state,
             transient,
             state_shortname,
+            cost,
         })
     }
 }
@@ -211,10 +223,24 @@ pub enum RegisterType {
     ReadWrite,
     /// StateChange(new_state, [instructions], shortname?)
     /// shortname is used for trait Step{Shortname} and method into_{shortname}
-    StateChange(State, Punctuated<syn::Path, syn::Token![,]>, Option<syn::Ident>),
+    StateChange(
+        State,
+        Punctuated<syn::Path, syn::Token![,]>,
+        Option<syn::Ident>,
+    ),
 }
 
 impl RegisterType {
+    pub fn state_change_method(&self) -> Option<Ident> {
+        match self {
+            Self::StateChange(state, _, shortname) => {
+                let name = shortname.as_ref().unwrap_or(&state.state_name);
+                Some(format_ident!("into_{}", name.to_string().to_lowercase()))
+            }
+            _ => None,
+        }
+    }
+
     pub fn to_ident(&self) -> Ident {
         match self {
             RegisterType::ReadOnly => format_ident!("ReadOnly"),
@@ -229,7 +255,7 @@ impl Parse for RegisterType {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let ident: Ident = input.parse()
             .map_err(|_| syn::Error::new(
-                input.span(), 
+                input.span(),
                 "Error parsing register type - expected register type (e.g. ReadOnly, WriteOnly) not provided.")
             )?;
 
@@ -276,7 +302,11 @@ impl Parse for RegisterType {
                     None
                 };
 
-                return Ok(RegisterType::StateChange(new_state, bitfield_instr, shortname));
+                return Ok(RegisterType::StateChange(
+                    new_state,
+                    bitfield_instr,
+                    shortname,
+                ));
             }
             _ => Err(syn::Error::new(
                 ident.span(),
@@ -289,6 +319,7 @@ impl Parse for RegisterType {
 pub struct RegisterAttributes {
     pub valid_states: Punctuated<State, syn::Token![,]>,
     pub register_type: RegisterType,
+    pub cost: usize,
 }
 
 impl Parse for RegisterAttributes {
@@ -317,9 +348,28 @@ impl Parse for RegisterAttributes {
             )
         })?;
 
+        let cost = if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            let key: Ident = input.parse()?;
+            if key != "cost" {
+                return Err(syn::Error::new(key.span(), "expected cost = value"));
+            }
+            input.parse::<syn::Token![=]>()?;
+            let lit: syn::LitInt = input.parse()?;
+
+            lit.base10_parse::<usize>()?
+        } else {
+            0
+        };
+
+        if !input.is_empty() {
+            return Err(syn::Error::new(input.span(), "unexpected tokens"));
+        }
+
         Ok(RegisterAttributes {
             valid_states,
             register_type,
+            cost,
         })
     }
 }
@@ -505,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_state_origin_definition_parse_simple() {
-        let input = quote! { (Off) };
+        let input = quote! { (Off, cost: 0) };
         let state_def: StateDefinition = syn::parse2(input).unwrap();
 
         assert_eq!(state_def.state.state_name.to_string(), "Off");
@@ -515,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_state_origin_definition_parse_with_substates() {
-        let input = quote! { (Active(Tx, Rx), ActiveTxRx) };
+        let input = quote! { (Active(Tx, Rx), ActiveTxRx, cost: 0) };
         let state_def: StateDefinition = syn::parse2(input).unwrap();
 
         assert_eq!(state_def.state.state_name.to_string(), "Active");
@@ -534,7 +584,7 @@ mod tests {
 
     #[test]
     fn test_state_origin_definition_transient_true() {
-        let input = quote! { (Loading, *T*) };
+        let input = quote! { (Loading, *T*, cost: 0) };
         let state_def: StateDefinition = syn::parse2(input).unwrap();
 
         assert_eq!(state_def.state.state_name.to_string(), "Loading");
@@ -544,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_state_origin_definition_transient_with_substates() {
-        let input = quote! { (Active(Tx, Rx), ActiveTxRx, *T*) };
+        let input = quote! { (Active(Tx, Rx), ActiveTxRx, *T*, cost: 0) };
         let state_def: StateDefinition = syn::parse2(input).unwrap();
 
         assert_eq!(state_def.state.state_name.to_string(), "Active");
@@ -555,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_state_origin_definition_transient_in_parentheses() {
-        let input = quote! { (Loading, *T*) };
+        let input = quote! { (Loading, *T*, cost: 0) };
         let state_def: StateDefinition = syn::parse2(input).unwrap();
 
         assert_eq!(state_def.state.state_name.to_string(), "Loading");
@@ -587,8 +637,8 @@ mod tests {
     }
 
     #[test]
-    fn test_register_type_state_change_rw() {
-        let reg_type = RegisterType::StateChangeRW;
+    fn test_register_type_state_change_ident() {
+        let reg_type: RegisterType = syn::parse_quote!(StateChange(Active, [ENABLE::SET]));
         assert_eq!(reg_type.to_ident().to_string(), "StateChange");
     }
 
@@ -611,10 +661,12 @@ mod tests {
 
     #[test]
     fn test_state_definition_no_trailing() {
-        let input = quote! { (Off) Other};
-        
+        let input = quote! { (Off, cost: 0) Other};
+
         let result: syn::Result<StateDefinition> = syn::parse2(input);
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("Unexpected tokens after state definition"));
+        assert!(err
+            .to_string()
+            .contains("Unexpected tokens after state definition"));
     }
 }

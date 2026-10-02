@@ -2,7 +2,9 @@
 use core::cell::Cell;
 use core::convert::TryFrom;
 
-pub use abacus_registers_dsl::process_register_block;
+pub use abacus_registers_dsl::{heliod, process_register_block};
+#[doc(hidden)]
+pub use abacus_registers_dsl::__heliod;
 pub use tock_registers;
 
 /// Trait denoting a register block and specifies

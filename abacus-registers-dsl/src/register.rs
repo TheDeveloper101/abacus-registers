@@ -5,6 +5,7 @@ use syn::{punctuated::Punctuated, Ident};
 use crate::parsing::{RegisterType, State};
 use std::collections::HashSet;
 
+#[derive(Clone)]
 pub struct Register {
     pub name: Ident,
     pub valid_states: Punctuated<State, syn::Token![,]>,
@@ -16,23 +17,31 @@ pub struct Register {
 impl Register {
     /// Create passthrough for valid tock-register operations for each
     /// AbacusRegister type.
-    pub fn generate_register_op_bindings(&self, register_name: &Ident) -> proc_macro2::TokenStream {
+    pub fn generate_register_op_bindings(
+        &self,
+        register_name: &Ident,
+    ) -> syn::Result<proc_macro2::TokenStream> {
+        if !matches!(self.register_type, RegisterType::StateChange(..))
+            && self.valid_states.len() > 1
+        {
+            let mut output = TokenStream::new();
+            for state in &self.valid_states {
+                let mut register = self.clone();
+                register.valid_states = std::iter::once(state.clone()).collect();
+                output.extend(register.generate_register_op_bindings(register_name)?);
+            }
+            return Ok(output);
+        }
         let register_bitwidth = self.register_bitwidth.clone();
         let register_shortname = self.register_shortname.clone();
-        let validstate = self
-            .valid_states
-            .first()
-            .expect("generate reg op bindings")
-            .form_state_marker_type();
-
-        // Determine if this state contains an Any substate.
-        let is_anytype = self
-            .valid_states
-            .first()
-            .unwrap()
-            .substates
-            .iter()
-            .any(|substate| substate.to_string() == "Any");
+        let first_state = self.valid_states.first().ok_or_else(|| {
+            syn::Error::new(
+                self.name.span(),
+                "expected at least one valid register state",
+            )
+        })?;
+        let validstate = first_state.form_state_marker_type();
+        let is_anytype = first_state.contains_any();
 
         // An `Any` substate means any state is valid. To mock up this behavior in the
         // type system, we must replace the Any substate with a generic type.
@@ -80,13 +89,11 @@ impl Register {
             )
         };
 
-        // FIXME: This only accounts for the first state. We need to account for all states.in the
-        // valid states. StateChangeRegister currently does this, but all register types should.
-        match &self.register_type {
+        Ok(match &self.register_type {
             RegisterType::ReadOnly => {
                 if is_anytype {
                     let (state_ident, generic_tokens, generic_tokens_constrained) =
-                        map_any(self.valid_states.first().unwrap().clone(), format! {"T"});
+                        map_any(first_state.clone(), format! {"T"});
                     quote! {
                         impl <#generic_tokens> ReadOnlyRegister<#register_bitwidth, #register_shortname, #state_ident>
                         where
@@ -119,7 +126,7 @@ impl Register {
             RegisterType::WriteOnly => {
                 if is_anytype {
                     let (state_ident, generic_tokens, generic_tokens_constrained) =
-                        map_any(self.valid_states.first().unwrap().clone(), format! {"T"});
+                        map_any(first_state.clone(), format! {"T"});
                     quote! {
                         impl <#generic_tokens> WriteOnlyRegister<#register_bitwidth, #register_shortname, #state_ident>
                         where
@@ -158,7 +165,7 @@ impl Register {
             RegisterType::ReadWrite => {
                 if is_anytype {
                     let (state_ident, generic_tokens, generic_tokens_constrained) =
-                        map_any(self.valid_states.first().unwrap().clone(), format! {"T"});
+                        map_any(first_state.clone(), format! {"T"});
                     quote! {
                         impl <#generic_tokens> ReadWriteRegister<#register_bitwidth, #register_shortname, #state_ident>
                         where
@@ -267,7 +274,7 @@ impl Register {
                     };
 
                     state_change_output.extend(quote! {
-                        trait #trait_name<#carrot_block>: Sized
+                        pub trait #trait_name<#carrot_block>: Sized
                         where
                             #to_state: State,
                             S: State,
@@ -326,7 +333,7 @@ impl Register {
                     let to_state = state.form_concrete_state_type();
 
                     state_change_output.extend(quote! {
-                        trait #trait_name<S: State>: Sized
+                        pub trait #trait_name<S: State>: Sized
                         where
                             #register_name<S>: Reg
                         {
@@ -360,7 +367,7 @@ impl Register {
                     state_change_output
                 }
             }
-        }
+        })
     }
 }
 

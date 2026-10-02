@@ -14,13 +14,14 @@
 //!     peripheral_name = "Nrf5xTemp",
 //!     register_base_addr = 0x4000C000,
 //!     states = [              <------------ Define peripheral states
-//!         (Off),
-//!         (Reading),
+//!         (Off, cost: 1),
+//!         (Reading, cost: 5),
 //!     ]
 //! )]
 //!
 //!
 
+mod cost;
 mod generating;
 mod macro_input;
 mod parsing;
@@ -28,7 +29,7 @@ mod register;
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, DeriveInput, Field, Type};
+use syn::{DeriveInput, Field, Type};
 
 use std::collections::HashSet;
 
@@ -38,7 +39,17 @@ use crate::register::Register;
 
 #[proc_macro_attribute]
 pub fn process_register_block(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let parsed_input = parse_macro_input!(attr as MacroInput);
+    expand_register_block(attr.into(), item.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn expand_register_block(
+    attr: proc_macro2::TokenStream,
+    item: proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let metadata = cost::metadata(attr.clone(), item.clone());
+    let parsed_input: MacroInput = syn::parse2(attr)?;
     let register = format_ident!("{}Registers", parsed_input.peripheral_name);
     let internal_register = format_ident!("Block");
     let state_enum_ident = format_ident!("{}StateEnum", parsed_input.peripheral_name);
@@ -51,18 +62,22 @@ pub fn process_register_block(attr: TokenStream, item: TokenStream) -> TokenStre
         &state_enum_ident,
     ));
 
-    let (states_generated, _) = parsed_input.generate_states(&register, &state_enum_ident);
+    let (states_generated, _) = parsed_input.generate_states(&register, &state_enum_ident)?;
     result.extend(states_generated);
 
-    let ast: DeriveInput =
-        syn::parse(item).expect("Abacus Macro - Error Parsing Provided AST of register struct.");
+    let ast: DeriveInput = syn::parse2(item)?;
     let data = match &ast.data {
         syn::Data::Struct(data) => data,
-        _ => panic!("Abacus Macro - Unsupported type; must be a struct."),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &ast,
+                "expected a register block struct",
+            ))
+        }
     };
 
-    let (field_details, reg_vec) = process_struct_fields(&data.fields);
-    result.extend(generate_register_bindings(&reg_vec, &register));
+    let (field_details, reg_vec) = process_struct_fields(&data.fields)?;
+    result.extend(generate_register_bindings(&reg_vec, &register)?);
     result.extend(register_type_definitions());
     result.extend(quote! {
         #[repr(C)]
@@ -71,12 +86,15 @@ pub fn process_register_block(attr: TokenStream, item: TokenStream) -> TokenStre
         }
     });
 
-    result.into()
+    result.extend(metadata);
+    Ok(result)
 }
 
 fn add_imports() -> proc_macro2::TokenStream {
     quote!(
-        use abacus_registers::{State, SubState, StateEnum, Reg, SyncState, TransientStateReg, AbacusStaticRef};
+        use abacus_registers::{
+            State, SubState, StateEnum, Reg, SyncState, TransientStateReg, AbacusStaticRef,
+        };
         use core::marker::PhantomData;
         use core::mem::transmute;
         use core::ops::Deref;
@@ -113,25 +131,27 @@ fn generate_register_wrapper(
     }
 }
 
-fn process_struct_fields(fields: &syn::Fields) -> (Vec<proc_macro2::TokenStream>, Vec<Register>) {
+fn process_struct_fields(
+    fields: &syn::Fields,
+) -> syn::Result<(Vec<proc_macro2::TokenStream>, Vec<Register>)> {
     let mut reg_vec = Vec::new();
     let field_details: Vec<_> = fields
         .iter()
         .map(|field| {
-            let (tokens, mut registers) = process_field(field);
+            let (tokens, mut registers) = process_field(field)?;
             reg_vec.append(&mut registers);
-            tokens
+            Ok(tokens)
         })
-        .collect();
-    (field_details, reg_vec)
+        .collect::<syn::Result<Vec<_>>>()?;
+    Ok((field_details, reg_vec))
 }
 
-fn process_field(field: &Field) -> (proc_macro2::TokenStream, Vec<Register>) {
+fn process_field(field: &Field) -> syn::Result<(proc_macro2::TokenStream, Vec<Register>)> {
     let field_type = field.ty.clone();
     let field_name = field
         .ident
         .clone()
-        .expect("Abacus Macro - Error in register struct field, expected field name.");
+        .ok_or_else(|| syn::Error::new_spanned(field, "expected a named register field"))?;
 
     let requires_gen = field
         .attrs
@@ -151,56 +171,60 @@ fn process_field(field: &Field) -> (proc_macro2::TokenStream, Vec<Register>) {
         .collect();
 
     if !requires_gen {
-        return (
+        return Ok((
             quote! { #(#field_attr)* pub #field_name: #field_type },
             vec![],
-        );
+        ));
     }
 
-    let reg_attr_vec: Vec<_> = field
+    let reg_attr_vec = field
         .attrs
         .iter()
         .filter_map(|attr| {
             if attr.path().is_ident("RegAttributes") {
-                attr.parse_args::<parsing::RegisterAttributes>().ok()
+                Some(attr.parse_args::<parsing::RegisterAttributes>())
             } else {
                 None
             }
         })
-        .collect();
+        .collect::<syn::Result<Vec<_>>>()?;
 
-    let Type::Path(type_path) = field_type.clone() else {
-        panic!("unreachable b");
+    let Type::Path(type_path) = &field_type else {
+        return Err(syn::Error::new_spanned(
+            &field_type,
+            "expected a tock-registers type",
+        ));
     };
-
-    let segment = type_path
-        .path
-        .segments
-        .last()
-        .expect("Abacus Macro - Error, parsing tock-registers field.");
-
+    let segment =
+        type_path.path.segments.last().ok_or_else(|| {
+            syn::Error::new_spanned(&field_type, "expected a tock-registers type")
+        })?;
     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
-        panic!("Abacus Macro - Error, parsing expects tock-registers types to have 2 generics.");
+        return Err(syn::Error::new_spanned(
+            segment,
+            "expected two register type arguments",
+        ));
     };
-
-    let generic_args = &args.args;
-    if generic_args.len() != 2 {
-        panic!("Abacus Macro - Error, parsing expects tock-registers types to have 2 generics.");
+    if args.args.len() != 2 {
+        return Err(syn::Error::new_spanned(
+            args,
+            "expected two register type arguments",
+        ));
     }
-
-    let register_shortname = generic_args[1].clone();
-    let register_bitwidth = match &generic_args[0] {
-        syn::GenericArgument::Type(Type::Path(tp)) => tp
-            .path
-            .segments
-            .first()
-            .expect(
-                "Abacus Macro - Error, parsing expects tock-registers types to have 2 generics.",
-            )
-            .ident
-            .clone(),
-        _ => panic!("Abacus Macro - Error, parsing generic arg 0."),
-    };
+    let register_bitwidth = match &args.args[0] {
+        syn::GenericArgument::Type(Type::Path(path)) => path.path.get_ident().cloned(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        syn::Error::new_spanned(&args.args[0], "expected a register bitwidth identifier")
+    })?;
+    let register_shortname = args.args[1].clone();
+    if !matches!(register_shortname, syn::GenericArgument::Type(_)) {
+        return Err(syn::Error::new_spanned(
+            &register_shortname,
+            "expected a register marker type",
+        ));
+    }
 
     let mut output = proc_macro2::TokenStream::new();
     let mut registers = Vec::new();
@@ -231,22 +255,22 @@ fn process_field(field: &Field) -> (proc_macro2::TokenStream, Vec<Register>) {
         output
     };
 
-    (output, registers)
+    Ok((output, registers))
 }
 
 fn generate_register_bindings(
     reg_vec: &[Register],
     register: &syn::Ident,
-) -> proc_macro2::TokenStream {
+) -> syn::Result<proc_macro2::TokenStream> {
     let mut result = proc_macro2::TokenStream::new();
     let mut seen = HashSet::new();
     for reg in reg_vec {
-        let binding = reg.generate_register_op_bindings(register);
+        let binding = reg.generate_register_op_bindings(register)?;
         if seen.insert(binding.clone().to_string()) {
             result.extend(binding);
         }
     }
-    result
+    Ok(result)
 }
 
 fn register_type_definitions() -> proc_macro2::TokenStream {
@@ -283,19 +307,110 @@ fn register_type_definitions() -> proc_macro2::TokenStream {
             associated_state: PhantomData<S>,
         }
 
-        struct ReadWriteRegister<T: UIntLike, R: RegisterLongName, S: State> {
+        pub struct ReadWriteRegister<T: UIntLike, R: RegisterLongName, S: State> {
             reg: ReadWrite<T, R>,
             associated_state: PhantomData<S>,
         }
 
-        struct ReadOnlyRegister<T: UIntLike, R: RegisterLongName, S: State> {
+        pub struct ReadOnlyRegister<T: UIntLike, R: RegisterLongName, S: State> {
             reg: ReadOnly<T, R>,
             associated_state: PhantomData<S>,
         }
 
-        struct WriteOnlyRegister<T: UIntLike, R: RegisterLongName, S: State> {
+        pub struct WriteOnlyRegister<T: UIntLike, R: RegisterLongName, S: State> {
             reg: WriteOnly<T, R>,
             associated_state: PhantomData<S>,
+        }
+    }
+}
+
+#[doc = include_str!("../COST_CHECKING.md")]
+#[proc_macro_attribute]
+pub fn heliod(attr: TokenStream, item: TokenStream) -> TokenStream {
+    cost::start(attr.into(), item.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+#[doc(hidden)]
+#[proc_macro]
+pub fn __heliod(input: TokenStream) -> TokenStream {
+    cost::expand(input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_register_block;
+    use quote::quote;
+
+    #[test]
+    fn malformed_register_blocks_return_diagnostics() {
+        let attributes = quote! {
+            peripheral_name = "Test", register_base_addr = 0,
+            states = [(Off, cost: 0)]
+        };
+        let cases = [
+            (
+                quote! { enum Registers { Off } },
+                "expected a register block struct",
+            ),
+            (
+                quote! { struct Registers(u32); },
+                "expected a named register field",
+            ),
+            (
+                quote! { struct Registers { #[RegAttributes([Off], ReadOnly)] data: [u32; 2] } },
+                "expected a tock-registers type",
+            ),
+            (
+                quote! { struct Registers { #[RegAttributes([Off], ReadOnly)] data: ReadOnly } },
+                "expected two register type arguments",
+            ),
+            (
+                quote! { struct Registers { #[RegAttributes([Off], ReadOnly)] data: ReadOnly<u32> } },
+                "expected two register type arguments",
+            ),
+            (
+                quote! { struct Registers { #[RegAttributes([Off], ReadOnly)] data: ReadOnly<3, Marker> } },
+                "expected a register bitwidth identifier",
+            ),
+            (
+                quote! { struct Registers { #[RegAttributes([Off], ReadOnly)] data: ReadOnly<u32, 3> } },
+                "expected a register marker type",
+            ),
+            (
+                quote! { struct Registers { #[RegAttributes([], ReadOnly)] data: ReadOnly<u32, Marker> } },
+                "expected at least one valid register state",
+            ),
+        ];
+        for (item, message) in cases {
+            let error = expand_register_block(attributes.clone(), item).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+            assert!(error
+                .into_compile_error()
+                .to_string()
+                .contains("compile_error"));
+        }
+    }
+
+    #[test]
+    fn invalid_peripheral_names_and_unsupported_substates_return_diagnostics() {
+        for (attributes, message) in [
+            (
+                quote! { peripheral_name = "not a name", register_base_addr = 0, states = [(Off, cost: 0)] },
+                "peripheral_name must be a Rust identifier",
+            ),
+            (
+                quote! { peripheral_name = "Test", register_base_addr = 0, states = [(Active(A, B, C), ActiveABC, cost: 0)] },
+                "Only 2 substates are supported",
+            ),
+        ] {
+            let error =
+                expand_register_block(attributes, quote! { struct Registers { reserved: u32 } })
+                    .unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
         }
     }
 }

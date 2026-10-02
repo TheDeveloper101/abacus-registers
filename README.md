@@ -20,8 +20,8 @@ Abacus, we first annotate the register `struct` as follows:
     peripheral_name = "Nrf5xTemp",
     register_base_addr = 0x4000C000,
     states = [
-        (Off),
-        (Reading),
+        (Off, cost: 1),
+        (Reading, cost: 5),
     ]
 )]
 struct TemperatureRegisters {
@@ -99,3 +99,11 @@ within a closure.
 
 (see [this branch](https://github.com/abacus-rs/tock/blob/master/chips/nrf5x/src/temperature.rs) for the full 
 example shown above)
+
+## Heliod cost checking
+
+States require integer background costs, e.g. `(Off, cost: 1)`. Register attributes
+accept an optional foreground cost, e.g. `#[RegAttributes([Off], ReadOnly, cost = 2)]`.
+Annotate real API functions with `#[heliod(PeripheralCost)]` to print their
+cost bounds during compilation. See the [usage guide](abacus-registers-dsl/COST_CHECKING.md)
+for helpers, `AbacusCell` drivers, and supported constructs.

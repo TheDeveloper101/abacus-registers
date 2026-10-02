@@ -9,5 +9,5 @@ license = "MIT"
 edition = "2021"
 
 [dependencies]
-abacus-registers-dsl = { version = "0.1.0"}
+abacus-registers-dsl = { version = "0.1.0", path = "abacus-registers-dsl" }
 tock-registers = "0.9.0"
