@@ -1,6 +1,10 @@
 //! Concrete state sets and integer costs. Rust remains responsible for value types
 //! and ownership; this pass tracks physical peripherals across Rust bindings.
-use super::model::Peripheral;
+use super::{
+    diagnostics::{self, Diagnostic},
+    model::Peripheral,
+};
+use crate::parsing::Cost;
 use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
 use syn::{
@@ -8,7 +12,7 @@ use syn::{
     Signature, Stmt, Type,
 };
 
-type States = BTreeSet<String>;
+pub type States = BTreeSet<String>;
 #[derive(Clone, PartialEq, Eq)]
 enum Value {
     Scalar,
@@ -18,9 +22,9 @@ enum Value {
     Object(String, BTreeMap<String, Value>),
 }
 #[derive(Clone)]
-struct Device {
-    model: usize,
-    states: States,
+pub(super) struct Device {
+    pub(super) model: usize,
+    pub(super) states: States,
 }
 #[derive(Clone, Default)]
 struct Context {
@@ -28,17 +32,252 @@ struct Context {
     devices: Vec<Device>,
     bindings: BTreeMap<String, Value>,
 }
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub enum ControlFlowSummary {
+    Empty,
+    Command(CommandSummary),
+    Sequence(Vec<ControlFlowSummary>),
+    Branch(Vec<ControlFlowSummary>),
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct CommandSummary {
+    pub foreground: usize,
+    pub background: Vec<BackgroundCharge>,
+    pub events: Vec<PeripheralEvent>,
+    pub span: proc_macro2::Span,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct BackgroundCharge {
+    pub device: usize,
+    pub states: States,
+    pub cost: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct PeripheralEvent {
+    pub device: usize,
+    pub operation: String,
+    pub source: States,
+    pub target: States,
+    pub transition: bool,
+    pub cost: usize,
+    pub span: proc_macro2::Span,
+}
+
+impl ControlFlowSummary {
+    pub fn cost(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Command(command) => {
+                command.foreground
+                    + command
+                        .background
+                        .iter()
+                        .map(|charge| charge.cost)
+                        .sum::<usize>()
+            }
+            Self::Sequence(parts) => parts.iter().map(Self::cost).sum(),
+            Self::Branch(arms) => arms.iter().map(Self::cost).max().unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+enum CostExpression {
+    Zero,
+    Number(usize),
+    Symbol(String),
+    Transition(String, String),
+    Sum(Vec<CostExpression>),
+    Maximum(Vec<CostExpression>),
+}
+
+impl CostExpression {
+    fn sum(expressions: impl IntoIterator<Item = Self>) -> Self {
+        let mut terms = Vec::new();
+        let mut number = 0;
+        for expression in expressions {
+            match expression {
+                Self::Zero => {}
+                Self::Number(value) => number += value,
+                Self::Sum(nested) => terms.extend(nested),
+                expression => terms.push(expression),
+            }
+        }
+        if number != 0 {
+            terms.push(Self::Number(number));
+        }
+        terms.sort();
+        match terms.len() {
+            0 => Self::Zero,
+            1 => terms.pop().unwrap(),
+            _ => Self::Sum(terms),
+        }
+    }
+
+    fn maximum(expressions: impl IntoIterator<Item = Self>) -> Self {
+        let mut terms = expressions.into_iter().collect::<Vec<_>>();
+        terms.sort();
+        terms.dedup();
+        match terms.len() {
+            0 => Self::Zero,
+            1 => terms.pop().unwrap(),
+            _ => Self::Maximum(terms),
+        }
+    }
+}
+
+impl std::fmt::Display for CostExpression {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero => write!(formatter, "0"),
+            Self::Number(value) => write!(formatter, "{value}"),
+            Self::Symbol(name) => write!(formatter, "{name}"),
+            Self::Transition(source, target) => write!(formatter, "{source} -> {target}"),
+            Self::Maximum(terms) => {
+                write!(formatter, "max(")?;
+                for (index, term) in terms.iter().enumerate() {
+                    if index != 0 {
+                        write!(formatter, ", ")?;
+                    }
+                    write!(formatter, "{term}")?;
+                }
+                write!(formatter, ")")
+            }
+            Self::Sum(terms) => {
+                let mut index = 0;
+                let mut first = true;
+                while index < terms.len() {
+                    let count = terms[index..]
+                        .iter()
+                        .take_while(|term| **term == terms[index])
+                        .count();
+                    if !first {
+                        write!(formatter, " + ")?;
+                    }
+                    if count > 1 {
+                        write!(formatter, "{count} * ")?;
+                    }
+                    if matches!(terms[index], Self::Transition(_, _)) {
+                        write!(formatter, "({})", terms[index])?;
+                    } else {
+                        write!(formatter, "{}", terms[index])?;
+                    }
+                    first = false;
+                    index += count;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn annotation(cost: &Cost) -> CostExpression {
+    match cost {
+        Cost::Concrete(0) => CostExpression::Zero,
+        Cost::Concrete(value) => CostExpression::Number(*value),
+        Cost::Symbolic(name) => CostExpression::Symbol(name.clone()),
+    }
+}
+
+fn state_label(model: &Peripheral, state: &str) -> String {
+    match &model.states[state].cost {
+        Cost::Concrete(value) => value.to_string(),
+        Cost::Symbolic(name) => name.clone(),
+    }
+}
+
+fn event_cost(
+    event: &PeripheralEvent,
+    devices: &[Device],
+    models: &[Peripheral],
+) -> CostExpression {
+    let model = &models[devices[event.device].model];
+    if event.transition && model.states.values().any(|state| state.cost.is_symbolic()) {
+        return CostExpression::maximum(event.source.iter().map(|source| {
+            let target = &model.operations[&(source.clone(), event.operation.clone())].target;
+            CostExpression::Transition(state_label(model, source), state_label(model, target))
+        }));
+    }
+    CostExpression::maximum(event.source.iter().map(|source| {
+        annotation(&model.operations[&(source.clone(), event.operation.clone())].cost)
+    }))
+}
+
+fn symbolic_cost(
+    summary: &ControlFlowSummary,
+    devices: &[Device],
+    models: &[Peripheral],
+) -> CostExpression {
+    match summary {
+        ControlFlowSummary::Empty => CostExpression::Zero,
+        ControlFlowSummary::Command(command) => CostExpression::sum(
+            command
+                .events
+                .iter()
+                .map(|event| event_cost(event, devices, models))
+                .chain(command.background.iter().map(|charge| {
+                    let model = &models[devices[charge.device].model];
+                    CostExpression::maximum(
+                        charge
+                            .states
+                            .iter()
+                            .map(|state| annotation(&model.states[state].cost)),
+                    )
+                })),
+        ),
+        ControlFlowSummary::Sequence(parts) => CostExpression::sum(
+            parts
+                .iter()
+                .map(|part| symbolic_cost(part, devices, models)),
+        ),
+        ControlFlowSummary::Branch(arms) => {
+            CostExpression::maximum(arms.iter().map(|arm| symbolic_cost(arm, devices, models)))
+        }
+    }
+}
+
+fn sequence(parts: impl IntoIterator<Item = ControlFlowSummary>) -> ControlFlowSummary {
+    let mut combined = Vec::new();
+    for part in parts {
+        match part {
+            ControlFlowSummary::Empty => {}
+            ControlFlowSummary::Sequence(nested) => combined.extend(nested),
+            part => combined.push(part),
+        }
+    }
+    match combined.len() {
+        0 => ControlFlowSummary::Empty,
+        1 => combined.pop().unwrap(),
+        _ => ControlFlowSummary::Sequence(combined),
+    }
+}
+
+#[derive(Clone)]
 struct Evaluation {
     value: Value,
     cost: usize,
+    summary: ControlFlowSummary,
+    events: Vec<PeripheralEvent>,
     returned: bool,
+    call_body_charged: bool,
 }
 impl Evaluation {
     fn new(value: Value, cost: usize) -> Self {
         Self {
             value,
             cost,
+            summary: ControlFlowSummary::Empty,
+            events: Vec::new(),
             returned: false,
+            call_body_charged: false,
         }
     }
 }
@@ -48,63 +287,163 @@ struct Function {
     body: Block,
     owner: Option<String>,
 }
+
+#[derive(Clone)]
+pub(super) struct FunctionAnalysis {
+    parameters: Vec<Value>,
+    pub(super) initial_devices: Vec<Device>,
+    final_devices: Vec<Device>,
+    result: Value,
+    pub(super) summary: ControlFlowSummary,
+}
+pub struct Report {
+    #[allow(dead_code)]
+    pub costs: Vec<(String, usize)>,
+    pub reported_costs: Vec<(String, String)>,
+    #[allow(dead_code)]
+    pub summaries: Vec<(String, ControlFlowSummary)>,
+    pub diagnostics: Vec<Diagnostic>,
+}
 struct Checker<'a> {
+    function: String,
+    diagnostics: Vec<Diagnostic>,
     models: &'a [Peripheral],
     functions: BTreeMap<String, Function>,
+    summaries: BTreeMap<String, FunctionAnalysis>,
     structs: BTreeMap<String, BTreeMap<String, Type>>,
 }
 
+#[cfg(test)]
 pub fn check(item: &Item, models: &[Peripheral]) -> Result<Vec<(String, usize)>> {
+    Ok(analyze(item, models)?.costs)
+}
+
+pub fn analyze(item: &Item, models: &[Peripheral]) -> Result<Report> {
     let mut checker = Checker {
+        function: String::new(),
+        diagnostics: Vec::new(),
         models,
         functions: BTreeMap::new(),
+        summaries: BTreeMap::new(),
         structs: BTreeMap::new(),
     };
     checker.collect(item, "")?;
-    let mut reports = Vec::new();
-    for (name, function) in checker.functions.clone() {
-        let mut context = Context {
-            scope: name
-                .rsplit_once("::")
-                .map(|(scope, _)| scope)
-                .unwrap_or("")
-                .into(),
-            ..Context::default()
-        };
-        for parameter in &function.signature.inputs {
-            match parameter {
-                FnArg::Typed(parameter) => {
-                    let value = checker.initial(&parameter.ty, &mut context)?;
-                    bind(&parameter.pat, value, &mut context)?;
-                }
-                FnArg::Receiver(_) => {
-                    let mut fields = BTreeMap::new();
-                    if let Some(types) =
-                        function.owner.as_ref().and_then(|o| checker.structs.get(o))
-                    {
-                        for (name, ty) in types {
-                            fields.insert(name.clone(), checker.initial(ty, &mut context)?);
-                        }
-                    }
-                    context.bindings.insert(
-                        "self".into(),
-                        Value::Object(function.owner.clone().unwrap_or_default(), fields),
-                    );
-                }
-            }
-        }
-        let result = checker.block(&function.body, &mut context)?;
-        reports.push((name, result.cost));
-    }
-    if reports.is_empty() {
+    if checker.functions.is_empty() {
         return Err(Error::new(
             item.span(),
             "expected a function, inherent impl, or inline API module",
         ));
     }
-    Ok(reports)
+    let names = checker.functions.keys().cloned().collect::<Vec<_>>();
+    for name in &names {
+        checker.summarize(name)?;
+    }
+    if !models.iter().any(Peripheral::is_symbolic) {
+        for name in &names {
+            let function = checker.summaries[name].clone();
+            checker
+                .diagnostics
+                .extend(super::burn::analyze(name, &function, checker.models));
+        }
+    }
+    let reports = names
+        .iter()
+        .map(|name| (name.clone(), checker.summaries[name].summary.cost()))
+        .collect();
+    let reported_costs = names
+        .iter()
+        .map(|name| {
+            let analysis = &checker.summaries[name];
+            let cost = if models.iter().any(Peripheral::is_symbolic) {
+                symbolic_cost(&analysis.summary, &analysis.initial_devices, models).to_string()
+            } else {
+                analysis.summary.cost().to_string()
+            };
+            (name.clone(), cost)
+        })
+        .collect();
+    let summaries = names
+        .into_iter()
+        .map(|name| (name.clone(), checker.summaries[&name].summary.clone()))
+        .collect();
+    Ok(Report {
+        costs: reports,
+        reported_costs,
+        summaries,
+        diagnostics: checker.diagnostics,
+    })
 }
 impl Checker<'_> {
+    fn summarize(&mut self, name: &str) -> Result<()> {
+        if self.summaries.contains_key(name) {
+            return Ok(());
+        }
+        let function = self
+            .functions
+            .get(name)
+            .cloned()
+            .ok_or_else(|| failure("unknown function"))?;
+        let saved_function = std::mem::replace(&mut self.function, name.to_owned());
+        let result = (|| {
+            let mut context = Context {
+                scope: name
+                    .rsplit_once("::")
+                    .map(|(scope, _)| scope)
+                    .unwrap_or("")
+                    .into(),
+                ..Context::default()
+            };
+            let mut parameters = Vec::new();
+            for parameter in &function.signature.inputs {
+                let value = match parameter {
+                    FnArg::Typed(parameter) => {
+                        let value = self.initial(&parameter.ty, &mut context)?;
+                        bind(&parameter.pat, value.clone(), &mut context)?;
+                        value
+                    }
+                    FnArg::Receiver(_) => {
+                        let mut fields = BTreeMap::new();
+                        let types = function
+                            .owner
+                            .as_ref()
+                            .and_then(|owner| self.structs.get(owner))
+                            .cloned()
+                            .unwrap_or_default();
+                        for (field, ty) in types {
+                            fields.insert(field, self.initial(&ty, &mut context)?);
+                        }
+                        let value =
+                            Value::Object(function.owner.clone().unwrap_or_default(), fields);
+                        context.bindings.insert("self".into(), value.clone());
+                        value
+                    }
+                };
+                parameters.push(value);
+            }
+            let initial_devices = context.devices.clone();
+            let evaluation = self.block(&function.body, &mut context)?;
+            if evaluation.summary.cost() != evaluation.cost {
+                return Err(Error::new(
+                    function.body.span(),
+                    "internal error: control-flow summary does not match the cost bound",
+                ));
+            }
+            self.summaries.insert(
+                name.to_owned(),
+                FunctionAnalysis {
+                    parameters,
+                    initial_devices,
+                    final_devices: context.devices,
+                    result: evaluation.value,
+                    summary: evaluation.summary,
+                },
+            );
+            Ok(())
+        })();
+        self.function = saved_function;
+        result
+    }
+
     fn collect(&mut self, item: &Item, scope: &str) -> Result<()> {
         match item {
             Item::Fn(f) => self.function(scope, &f.sig, &f.block, None)?,
@@ -254,27 +593,98 @@ impl Checker<'_> {
             "unmodeled parameter or field type; select its cost provider",
         ))
     }
-    fn background(&self, context: &Context) -> usize {
-        let mut total = 0;
-        for device in &context.devices {
+    fn background_charges(
+        &self,
+        context: &Context,
+        transitioning: &BTreeSet<usize>,
+    ) -> Vec<BackgroundCharge> {
+        let mut charges = Vec::new();
+        for (id, device) in context.devices.iter().enumerate() {
+            if transitioning.contains(&id) {
+                continue;
+            }
             let states = &self.models[device.model].states;
             let cost = device
                 .states
                 .iter()
-                .map(|s| states[s].cost)
+                .filter_map(|s| states[s].cost.concrete())
                 .max()
                 .unwrap_or(0);
-            total += cost;
+            charges.push(BackgroundCharge {
+                device: id,
+                states: device.states.clone(),
+                cost,
+            });
         }
-        total
+        charges
     }
+
+    fn transitioning_devices(
+        &self,
+        expr: &Expr,
+        context: &Context,
+        transitioning: &mut BTreeSet<usize>,
+    ) {
+        match expr {
+            Expr::MethodCall(call) => {
+                let name = call.method.to_string();
+                if let Ok(Value::Register(id)) = lookup(&call.receiver, context) {
+                    let device = &context.devices[id];
+                    let model = &self.models[device.model];
+                    if device.states.iter().all(|state| {
+                        model
+                            .operations
+                            .get(&(state.clone(), name.clone()))
+                            .is_some_and(|operation| operation.transition)
+                    }) {
+                        transitioning.insert(id);
+                    }
+                }
+                self.transitioning_devices(&call.receiver, context, transitioning);
+                for argument in &call.args {
+                    self.transitioning_devices(argument, context, transitioning);
+                }
+            }
+            Expr::Call(call) => {
+                for argument in &call.args {
+                    self.transitioning_devices(argument, context, transitioning);
+                }
+            }
+            Expr::Paren(expr) => self.transitioning_devices(&expr.expr, context, transitioning),
+            Expr::Reference(expr) => self.transitioning_devices(&expr.expr, context, transitioning),
+            Expr::Return(expr) => {
+                if let Some(expr) = &expr.expr {
+                    self.transitioning_devices(expr, context, transitioning);
+                }
+            }
+            Expr::Tuple(tuple) => {
+                for expr in &tuple.elems {
+                    self.transitioning_devices(expr, context, transitioning);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn block(&mut self, block: &Block, context: &mut Context) -> Result<Evaluation> {
         let original = context.bindings.clone();
         let mut result = Evaluation::new(Value::Scalar, 0);
         for statement in &block.stmts {
-            if !matches!(statement, Stmt::Expr(Expr::Block(_), _)) {
-                result.cost += self.background(context);
-            }
+            let expression = match statement {
+                Stmt::Local(local) => local.init.as_ref().map(|init| init.expr.as_ref()),
+                Stmt::Expr(expression, _) => Some(expression),
+                _ => None,
+            };
+            let has_outer_command = !matches!(statement, Stmt::Expr(Expr::Block(_), _));
+            let background = if !has_outer_command {
+                Vec::new()
+            } else {
+                let mut transitioning = BTreeSet::new();
+                if let Some(expression) = expression {
+                    self.transitioning_devices(expression, context, &mut transitioning);
+                }
+                self.background_charges(context, &transitioning)
+            };
             let next = match statement {
                 Stmt::Local(local) => {
                     let init = local
@@ -292,7 +702,11 @@ impl Checker<'_> {
                         ));
                     }
                     bind(&local.pat, value.value, context)?;
-                    Evaluation::new(Value::Scalar, value.cost)
+                    let mut local = Evaluation::new(Value::Scalar, value.cost);
+                    local.summary = value.summary;
+                    local.events = value.events;
+                    local.call_body_charged = value.call_body_charged;
+                    local
                 }
                 Stmt::Expr(expr, semicolon) => {
                     let mut value = self.expression(expr, context)?;
@@ -308,6 +722,27 @@ impl Checker<'_> {
                     ))
                 }
             };
+            let nested_cost = next.summary.cost();
+            let foreground = next.cost - nested_cost;
+            let mut statement_parts = Vec::new();
+            if has_outer_command && !next.call_body_charged {
+                result.cost += background.iter().map(|charge| charge.cost).sum::<usize>();
+                statement_parts.push(ControlFlowSummary::Command(CommandSummary {
+                    foreground,
+                    background,
+                    events: next.events,
+                    span: statement.span(),
+                }));
+            } else if foreground != 0 || !next.events.is_empty() {
+                statement_parts.push(ControlFlowSummary::Command(CommandSummary {
+                    foreground,
+                    background: Vec::new(),
+                    events: next.events,
+                    span: statement.span(),
+                }));
+            }
+            statement_parts.push(next.summary);
+            result.summary = sequence([result.summary, sequence(statement_parts)]);
             result.cost += next.cost;
             result.value = next.value;
             result.returned = next.returned;
@@ -324,9 +759,33 @@ impl Checker<'_> {
         if let Expr::Block(block) = expr {
             return self.block(&block.block, context);
         }
-        let background = self.background(context);
+        let mut transitioning = BTreeSet::new();
+        self.transitioning_devices(expr, context, &mut transitioning);
+        let background = self.background_charges(context, &transitioning);
         let mut result = self.expression(expr, context)?;
-        result.cost += background;
+        let foreground = result.cost - result.summary.cost();
+        let mut parts = Vec::new();
+        if !result.call_body_charged {
+            result.cost += background.iter().map(|charge| charge.cost).sum::<usize>();
+            parts.push(ControlFlowSummary::Command(CommandSummary {
+                foreground,
+                background,
+                events: std::mem::take(&mut result.events),
+                span: expr.span(),
+            }));
+        } else if foreground != 0 || !result.events.is_empty() {
+            parts.push(ControlFlowSummary::Command(CommandSummary {
+                foreground,
+                background: Vec::new(),
+                events: std::mem::take(&mut result.events),
+                span: expr.span(),
+            }));
+        }
+        parts.push(std::mem::replace(
+            &mut result.summary,
+            ControlFlowSummary::Empty,
+        ));
+        result.summary = sequence(parts);
         Ok(result)
     }
     fn expression(&mut self, expr: &Expr, context: &mut Context) -> Result<Evaluation> {
@@ -348,19 +807,26 @@ impl Checker<'_> {
             Expr::Tuple(tuple) => {
                 let mut values = Vec::new();
                 let mut cost = 0;
+                let mut summaries = Vec::new();
+                let mut events = Vec::new();
                 for expr in &tuple.elems {
                     let value = self.expression(expr, context)?;
                     cost += value.cost;
+                    summaries.push(value.summary);
+                    events.extend(value.events);
                     values.push(value.value);
                 }
-                Ok(Evaluation::new(
+                let mut result = Evaluation::new(
                     if values.is_empty() {
                         Value::Scalar
                     } else {
                         Value::Tuple(values)
                     },
                     cost,
-                ))
+                );
+                result.summary = sequence(summaries);
+                result.events = events;
+                Ok(result)
             }
             Expr::Unary(unary) if !matches!(unary.op, syn::UnOp::Deref(_)) => {
                 let result = self.expression(&unary.expr, context)?;
@@ -400,7 +866,11 @@ impl Checker<'_> {
                 if matches!(binary.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) {
                     *context = join_context(&before, context)?;
                 }
-                Ok(Evaluation::new(Value::Scalar, left.cost + right.cost))
+                let mut result = Evaluation::new(Value::Scalar, left.cost + right.cost);
+                result.summary = sequence([left.summary, right.summary]);
+                result.events = left.events;
+                result.events.extend(right.events);
+                Ok(result)
             }
             Expr::If(branch) => {
                 let condition = self.expression(&branch.cond, context)?;
@@ -413,6 +883,8 @@ impl Checker<'_> {
                     Evaluation::new(Value::Scalar, 0)
                 };
                 let mut result = join_result(left, right)?;
+                result.summary = sequence([condition.summary, result.summary]);
+                result.events = condition.events;
                 *context = join_context(&left_context, &right_context)?;
                 result.cost += condition.cost;
                 Ok(result)
@@ -435,13 +907,20 @@ impl Checker<'_> {
                     .to_string();
                 let mut values = Vec::new();
                 let mut cost = 0;
+                let mut summaries = Vec::new();
+                let mut events = Vec::new();
                 for argument in &call.args {
                     let value = self.expression(argument, context)?;
                     cost += value.cost;
+                    summaries.push(value.summary);
+                    events.extend(value.events);
                     values.push(value.value);
                 }
                 if matches!(name.as_str(), "Ok" | "Err" | "Some") {
-                    return Ok(Evaluation::new(Value::Scalar, cost));
+                    let mut result = Evaluation::new(Value::Scalar, cost);
+                    result.summary = sequence(summaries);
+                    result.events = events;
+                    return Ok(result);
                 }
                 let key = path
                     .path
@@ -450,8 +929,11 @@ impl Checker<'_> {
                     .map(|s| s.ident.to_string())
                     .collect::<Vec<_>>()
                     .join("::");
-                let mut result = self.call(&key, values, context)?;
+                let mut result = self.call(&key, values, context, call.span())?;
                 result.cost += cost;
+                result.summary = sequence([sequence(summaries), result.summary]);
+                result.events.extend(events);
+                result.call_body_charged = true;
                 Ok(result)
             }
             _ => Err(Error::new(
@@ -511,7 +993,7 @@ impl Checker<'_> {
                         )
                     })?;
                 targets.insert(op.target.clone());
-                cost = cost.max(op.cost);
+                cost = cost.max(op.cost.concrete().unwrap_or(0));
                 transition = op.transition;
             }
             if targets.iter().any(|s| model.states[s].transient) {
@@ -520,30 +1002,73 @@ impl Checker<'_> {
                     "transient states require hardware-concurrency analysis",
                 ));
             }
+            if !transition && !model.is_symbolic() {
+                let current_states = device
+                    .states
+                    .iter()
+                    .map(|state| (state.clone(), model.states[state].cost.concrete().unwrap()))
+                    .collect::<Vec<_>>();
+                if let Some(diagnostic) = diagnostics::operation(
+                    &self.function,
+                    call.span(),
+                    &operation,
+                    &model.registers,
+                    &current_states,
+                ) {
+                    self.diagnostics.push(diagnostic);
+                }
+            }
+            let source = device.states.clone();
+            let operation_cost = cost;
+            let mut summaries = Vec::new();
+            let mut argument_events = Vec::new();
             for arg in &call.args {
-                cost += self.expression(arg, context)?.cost;
+                let argument = self.expression(arg, context)?;
+                cost += argument.cost;
+                summaries.push(argument.summary);
+                argument_events.extend(argument.events);
             }
             context.devices[id].states = targets;
-            return Ok(Evaluation::new(
+            let target = context.devices[id].states.clone();
+            let mut result = Evaluation::new(
                 if transition {
                     Value::Register(id)
                 } else {
                     Value::Scalar
                 },
                 cost,
-            ));
+            );
+            result.summary = sequence(summaries);
+            result.events = argument_events;
+            result.events.push(PeripheralEvent {
+                device: id,
+                operation,
+                source,
+                target,
+                transition,
+                cost: operation_cost,
+                span: call.span(),
+            });
+            return Ok(result);
         }
         if let Ok(Value::Object(owner, fields)) = lookup(&call.receiver, context) {
             let value = Value::Object(owner.clone(), fields);
             let mut values = vec![value];
             let mut cost = 0;
+            let mut summaries = Vec::new();
+            let mut events = Vec::new();
             for arg in &call.args {
                 let value = self.expression(arg, context)?;
                 values.push(value.value);
                 cost += value.cost;
+                summaries.push(value.summary);
+                events.extend(value.events);
             }
-            let mut result = self.call(&qualify(&owner, &name), values, context)?;
+            let mut result = self.call(&qualify(&owner, &name), values, context, call.span())?;
             result.cost += cost;
+            result.summary = sequence([sequence(summaries), result.summary]);
+            result.events.extend(events);
+            result.call_body_charged = true;
             return Ok(result);
         }
         Err(Error::new(
@@ -587,7 +1112,10 @@ impl Checker<'_> {
         context.bindings = before.bindings.clone();
         // None means the callback did not run. Keep both outcomes for later work.
         *context = join_context(&before, context)?;
-        Ok(Evaluation::new(Value::Scalar, result.cost))
+        let mut mapped = Evaluation::new(Value::Scalar, result.cost);
+        mapped.summary = result.summary;
+        mapped.events = result.events;
+        Ok(mapped)
     }
     fn match_states(
         &mut self,
@@ -662,6 +1190,8 @@ impl Checker<'_> {
             joined.ok_or_else(|| Error::new(branch.span(), "empty state match"))?;
         *context = updated;
         result.cost += subject.cost;
+        result.summary = sequence([subject.summary, result.summary]);
+        result.events = subject.events;
         Ok(result)
     }
     fn call(
@@ -669,6 +1199,7 @@ impl Checker<'_> {
         requested: &str,
         values: Vec<Value>,
         context: &mut Context,
+        span: proc_macro2::Span,
     ) -> Result<Evaluation> {
         let scope = context.scope.as_str();
         let name = if let Some(method) = requested.strip_prefix("Self::") {
@@ -692,24 +1223,210 @@ impl Checker<'_> {
         if function.signature.inputs.len() != values.len() {
             return Err(failure("helper argument count mismatch"));
         }
-        let saved = std::mem::take(&mut context.bindings);
-        for (argument, value) in function.signature.inputs.iter().zip(values) {
-            match argument {
-                FnArg::Typed(argument) => bind(&argument.pat, value, context)?,
-                FnArg::Receiver(_) => {
-                    context.bindings.insert("self".into(), value);
-                }
+        self.summarize(&name)?;
+        let summary = self.summaries[&name].clone();
+        self.instantiate(&summary, values, context, span)
+    }
+
+    fn instantiate(
+        &self,
+        function: &FunctionAnalysis,
+        arguments: Vec<Value>,
+        context: &mut Context,
+        span: proc_macro2::Span,
+    ) -> Result<Evaluation> {
+        let mut devices = vec![None; function.initial_devices.len()];
+        for (parameter, argument) in function.parameters.iter().zip(&arguments) {
+            map_argument(parameter, argument, &mut devices, span)?;
+        }
+        let mapped = devices
+            .into_iter()
+            .map(|device| {
+                device.ok_or_else(|| {
+                    Error::new(span, "function summary contains an unmapped peripheral")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let unique = mapped.iter().copied().collect::<BTreeSet<_>>();
+        if unique.len() != mapped.len() {
+            return Err(Error::new(
+                span,
+                "passing the same peripheral as multiple arguments is not supported",
+            ));
+        }
+        for (formal, actual) in function.initial_devices.iter().zip(&mapped) {
+            let actual = context
+                .devices
+                .get(*actual)
+                .ok_or_else(|| Error::new(span, "unknown peripheral argument"))?;
+            if formal.model != actual.model || !actual.states.is_subset(&formal.states) {
+                return Err(Error::new(
+                    span,
+                    "peripheral argument does not satisfy the function input states",
+                ));
             }
         }
-        let scope = name.rsplit_once("::").map(|(scope, _)| scope).unwrap_or("");
-        let saved_scope = std::mem::replace(&mut context.scope, scope.into());
-        let result = self.block(&function.body, context);
-        context.scope = saved_scope;
-        context.bindings = saved;
-        let mut result = result?;
-        result.returned = false;
+
+        let summary =
+            self.instantiate_control_flow(&function.summary, &mapped, context, &unique)?;
+        for (formal, actual) in function.final_devices.iter().zip(&mapped) {
+            context.devices[*actual].states = formal.states.clone();
+        }
+        let value = map_result(&function.result, &mapped, span)?;
+        let cost = summary.cost();
+        let mut result = Evaluation::new(value, cost);
+        result.summary = summary;
         Ok(result)
     }
+
+    fn instantiate_control_flow(
+        &self,
+        summary: &ControlFlowSummary,
+        devices: &[usize],
+        context: &Context,
+        mapped: &BTreeSet<usize>,
+    ) -> Result<ControlFlowSummary> {
+        Ok(match summary {
+            ControlFlowSummary::Empty => ControlFlowSummary::Empty,
+            ControlFlowSummary::Command(command) => {
+                let mut background = command
+                    .background
+                    .iter()
+                    .map(|charge| {
+                        Ok(BackgroundCharge {
+                            device: *devices.get(charge.device).ok_or_else(|| {
+                                Error::new(command.span, "invalid summarized peripheral")
+                            })?,
+                            states: charge.states.clone(),
+                            cost: charge.cost,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for (device, state) in context.devices.iter().enumerate() {
+                    if mapped.contains(&device) {
+                        continue;
+                    }
+                    let states = &self.models[state.model].states;
+                    background.push(BackgroundCharge {
+                        device,
+                        states: state.states.clone(),
+                        cost: state
+                            .states
+                            .iter()
+                            .filter_map(|name| states[name].cost.concrete())
+                            .max()
+                            .unwrap_or(0),
+                    });
+                }
+                let events = command
+                    .events
+                    .iter()
+                    .map(|event| {
+                        Ok(PeripheralEvent {
+                            device: *devices.get(event.device).ok_or_else(|| {
+                                Error::new(command.span, "invalid summarized peripheral event")
+                            })?,
+                            operation: event.operation.clone(),
+                            source: event.source.clone(),
+                            target: event.target.clone(),
+                            transition: event.transition,
+                            cost: event.cost,
+                            span: event.span,
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+                ControlFlowSummary::Command(CommandSummary {
+                    foreground: command.foreground,
+                    background,
+                    events,
+                    span: command.span,
+                })
+            }
+            ControlFlowSummary::Sequence(parts) => ControlFlowSummary::Sequence(
+                parts
+                    .iter()
+                    .map(|part| self.instantiate_control_flow(part, devices, context, mapped))
+                    .collect::<Result<_>>()?,
+            ),
+            ControlFlowSummary::Branch(arms) => ControlFlowSummary::Branch(
+                arms.iter()
+                    .map(|arm| self.instantiate_control_flow(arm, devices, context, mapped))
+                    .collect::<Result<_>>()?,
+            ),
+        })
+    }
+}
+
+fn map_argument(
+    formal: &Value,
+    actual: &Value,
+    devices: &mut [Option<usize>],
+    span: proc_macro2::Span,
+) -> Result<()> {
+    match (formal, actual) {
+        (Value::Scalar, Value::Scalar) => Ok(()),
+        (Value::Register(formal), Value::Register(actual))
+        | (Value::Cell(formal), Value::Cell(actual)) => {
+            let mapped = devices
+                .get_mut(*formal)
+                .ok_or_else(|| Error::new(span, "invalid formal peripheral"))?;
+            if mapped.is_some_and(|mapped| mapped != *actual) {
+                return Err(Error::new(span, "inconsistent peripheral argument"));
+            }
+            *mapped = Some(*actual);
+            Ok(())
+        }
+        (Value::Tuple(formal), Value::Tuple(actual)) if formal.len() == actual.len() => {
+            for (formal, actual) in formal.iter().zip(actual) {
+                map_argument(formal, actual, devices, span)?;
+            }
+            Ok(())
+        }
+        (Value::Object(formal_owner, formal), Value::Object(actual_owner, actual))
+            if formal_owner == actual_owner =>
+        {
+            for (name, formal) in formal {
+                let actual = actual
+                    .get(name)
+                    .ok_or_else(|| Error::new(span, "receiver field is unavailable"))?;
+                map_argument(formal, actual, devices, span)?;
+            }
+            Ok(())
+        }
+        _ => Err(Error::new(
+            span,
+            "function argument does not match its parameter",
+        )),
+    }
+}
+
+fn map_result(value: &Value, devices: &[usize], span: proc_macro2::Span) -> Result<Value> {
+    Ok(match value {
+        Value::Scalar => Value::Scalar,
+        Value::Register(device) => Value::Register(
+            *devices
+                .get(*device)
+                .ok_or_else(|| Error::new(span, "invalid summarized return peripheral"))?,
+        ),
+        Value::Cell(device) => Value::Cell(
+            *devices
+                .get(*device)
+                .ok_or_else(|| Error::new(span, "invalid summarized return cell"))?,
+        ),
+        Value::Tuple(values) => Value::Tuple(
+            values
+                .iter()
+                .map(|value| map_result(value, devices, span))
+                .collect::<Result<_>>()?,
+        ),
+        Value::Object(owner, fields) => Value::Object(
+            owner.clone(),
+            fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), map_result(value, devices, span)?)))
+                .collect::<Result<_>>()?,
+        ),
+    })
 }
 fn lookup(expr: &Expr, context: &Context) -> Result<Value> {
     match expr {
@@ -781,10 +1498,14 @@ fn join_result(left: Evaluation, right: Evaluation) -> Result<Evaluation> {
     if left.value != right.value {
         return Err(failure("branches return different peripheral identities"));
     }
+    let summary = ControlFlowSummary::Branch(vec![left.summary, right.summary]);
     Ok(Evaluation {
         value: left.value,
         cost: left.cost.max(right.cost),
+        summary,
+        events: Vec::new(),
         returned: left.returned,
+        call_body_charged: false,
     })
 }
 fn type_name(ty: &Type) -> Result<String> {

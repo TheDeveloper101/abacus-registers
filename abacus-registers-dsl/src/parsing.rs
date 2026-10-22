@@ -59,6 +59,46 @@ use syn::{
     Ident, LitInt,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Cost {
+    Concrete(usize),
+    Symbolic(String),
+}
+
+impl Cost {
+    pub fn concrete(&self) -> Option<usize> {
+        match self {
+            Self::Concrete(value) => Some(*value),
+            Self::Symbolic(_) => None,
+        }
+    }
+
+    pub fn is_symbolic(&self) -> bool {
+        matches!(self, Self::Symbolic(_))
+    }
+}
+
+impl PartialEq<usize> for Cost {
+    fn eq(&self, other: &usize) -> bool {
+        self.concrete() == Some(*other)
+    }
+}
+
+impl Parse for Cost {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if input.peek(LitInt) {
+            return Ok(Self::Concrete(input.parse::<LitInt>()?.base10_parse()?));
+        }
+        if input.peek(Ident) {
+            return Ok(Self::Symbolic(input.parse::<Ident>()?.to_string()));
+        }
+        Err(syn::Error::new(
+            input.span(),
+            "expected an integer or symbolic cost name",
+        ))
+    }
+}
+
 /// Helper struct for parsing macro input (Abacus DSL) and
 /// used later for code gen.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
@@ -73,7 +113,7 @@ pub struct StateDefinition {
     pub state: State,
     pub transient: bool,
     pub state_shortname: syn::Ident,
-    pub cost: usize,
+    pub cost: Cost,
 }
 
 impl Parse for State {
@@ -183,10 +223,13 @@ impl Parse for StateDefinition {
         };
         let keyword: Ident = state_definition.parse()?;
         if keyword != "cost" {
-            return Err(syn::Error::new(keyword.span(), "expected cost: number"));
+            return Err(syn::Error::new(
+                keyword.span(),
+                "expected cost: followed by an integer or symbolic name",
+            ));
         }
         state_definition.parse::<syn::Token![:]>()?;
-        let cost = state_definition.parse::<LitInt>()?.base10_parse()?;
+        let cost = state_definition.parse::<Cost>()?;
 
         // Check if anything else is left in the state definition
         if !state_definition.is_empty() {
@@ -319,7 +362,7 @@ impl Parse for RegisterType {
 pub struct RegisterAttributes {
     pub valid_states: Punctuated<State, syn::Token![,]>,
     pub register_type: RegisterType,
-    pub cost: usize,
+    pub cost: Cost,
 }
 
 impl Parse for RegisterAttributes {
@@ -355,11 +398,9 @@ impl Parse for RegisterAttributes {
                 return Err(syn::Error::new(key.span(), "expected cost = value"));
             }
             input.parse::<syn::Token![=]>()?;
-            let lit: syn::LitInt = input.parse()?;
-
-            lit.base10_parse::<usize>()?
+            input.parse::<Cost>()?
         } else {
-            0
+            Cost::Concrete(0)
         };
 
         if !input.is_empty() {

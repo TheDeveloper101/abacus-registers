@@ -1,5 +1,7 @@
 //! Pass the existing register specification to checks on ordinary Rust APIs.
+mod burn;
 mod checking;
+mod diagnostics;
 mod model;
 
 use proc_macro2::TokenStream;
@@ -104,11 +106,12 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         return Ok(quote! { #provider! { [#models] [#(#remaining),*] {#item} } });
     }
     let Specifications(models) = syn::parse2(models)?;
-    for (name, cost) in checking::check(&item, &models)? {
+    let report = checking::analyze(&item, &models)?;
+    for (name, cost) in report.reported_costs {
         eprintln!("Heliod cost for {name}: {cost}");
     }
-    // Emit the original API unchanged after checking it.
-    Ok(quote! { #item })
+    let warnings = diagnostics::warnings(report.diagnostics);
+    Ok(quote! { #item #warnings })
 }
 
 #[cfg(test)]

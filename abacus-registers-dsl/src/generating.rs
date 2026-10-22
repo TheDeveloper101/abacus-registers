@@ -289,6 +289,7 @@ pub fn generate_state_trait_impls_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parsing::Cost;
     use syn::parse_quote;
 
     /// State definitions matching the Nrf5xTemp temperature sensor (Off, Reading).
@@ -297,7 +298,7 @@ mod tests {
             {
                 let state: State = parse_quote!(Off);
                 StateDefinition {
-                    cost: 0,
+                    cost: Cost::Concrete(0),
                     state,
                     transient: false,
                     state_shortname: parse_quote!(Off),
@@ -306,7 +307,7 @@ mod tests {
             {
                 let state: State = parse_quote!(Reading);
                 StateDefinition {
-                    cost: 0,
+                    cost: Cost::Concrete(0),
                     state,
                     transient: false,
                     state_shortname: parse_quote!(Reading),
@@ -321,7 +322,7 @@ mod tests {
             {
                 let state: State = parse_quote!(Off);
                 StateDefinition {
-                    cost: 0,
+                    cost: Cost::Concrete(0),
                     state,
                     transient: false,
                     state_shortname: parse_quote!(Off),
@@ -330,7 +331,7 @@ mod tests {
             {
                 let state: State = parse_quote!(Active(RxIdle, TxIdle));
                 StateDefinition {
-                    cost: 0,
+                    cost: Cost::Concrete(0),
                     state,
                     transient: false,
                     state_shortname: parse_quote!(ActiveIdle),
@@ -339,7 +340,7 @@ mod tests {
             {
                 let state: State = parse_quote!(Active(Transient, TxIdle));
                 StateDefinition {
-                    cost: 0,
+                    cost: Cost::Concrete(0),
                     state,
                     transient: false,
                     state_shortname: parse_quote!(ActiveRx),
@@ -348,7 +349,7 @@ mod tests {
             {
                 let state: State = parse_quote!(Active(RxIdle, Transient));
                 StateDefinition {
-                    cost: 0,
+                    cost: Cost::Concrete(0),
                     state,
                     transient: false,
                     state_shortname: parse_quote!(ActiveTx),
@@ -357,7 +358,7 @@ mod tests {
             {
                 let state: State = parse_quote!(Active(Transient, Transient));
                 StateDefinition {
-                    cost: 0,
+                    cost: Cost::Concrete(0),
                     state,
                     transient: false,
                     state_shortname: parse_quote!(ActiveRxTx),
@@ -449,7 +450,7 @@ mod tests {
     fn state_loading_transient() -> StateDefinition {
         let state: State = parse_quote!(Loading);
         StateDefinition {
-            cost: 0,
+            cost: Cost::Concrete(0),
             state,
             transient: true,
             state_shortname: parse_quote!(Loading),
@@ -459,7 +460,7 @@ mod tests {
     fn state_off_def() -> StateDefinition {
         let state: State = parse_quote!(Off);
         StateDefinition {
-            cost: 0,
+            cost: Cost::Concrete(0),
             state,
             transient: false,
             state_shortname: parse_quote!(Off),
@@ -598,7 +599,7 @@ mod tests {
     fn test_generate_state_with_any_uses_impl_generics() {
         let state: State = parse_quote!(Active(RxIdle, Any));
         let state_def = StateDefinition {
-            cost: 0,
+            cost: Cost::Concrete(0),
             state,
             transient: false,
             state_shortname: parse_quote!(ActiveIdle),
@@ -628,7 +629,7 @@ mod tests {
     #[test]
     fn test_generate_state_conversion_impls_only_emits_reg() {
         let state_def = StateDefinition {
-            cost: 0,
+            cost: Cost::Concrete(0),
             state: parse_quote!(Active(RxIdle, TxIdle)),
             transient: false,
             state_shortname: parse_quote!(ActiveIdle),
@@ -650,7 +651,7 @@ mod tests {
     #[test]
     fn test_generate_state_conversion_impls_only_emits_from_tryfrom() {
         let state_def = StateDefinition {
-            cost: 0,
+            cost: Cost::Concrete(0),
             state: parse_quote!(Active(RxIdle, TxIdle)),
             transient: false,
             state_shortname: parse_quote!(ActiveIdle),
@@ -669,7 +670,7 @@ mod tests {
     #[test]
     fn test_generate_state_conversion_impls_only_no_state_impl() {
         let state_def = StateDefinition {
-            cost: 0,
+            cost: Cost::Concrete(0),
             state: parse_quote!(Active(RxIdle, TxIdle)),
             transient: false,
             state_shortname: parse_quote!(ActiveIdle),
@@ -691,7 +692,7 @@ mod tests {
     #[test]
     fn test_generate_state_trait_impls_only_state_only() {
         let state_def = StateDefinition {
-            cost: 0,
+            cost: Cost::Concrete(0),
             state: parse_quote!(Active(Any, Any)),
             transient: false,
             state_shortname: parse_quote!(ActiveIdle),
@@ -741,7 +742,7 @@ mod tests {
         }
         // Add generic State impl (from Any,Any case)
         let any_any_def = StateDefinition {
-            cost: 0,
+            cost: Cost::Concrete(0),
             state: parse_quote!(Active(Any, Any)),
             transient: false,
             state_shortname: parse_quote!(ActiveIdle),

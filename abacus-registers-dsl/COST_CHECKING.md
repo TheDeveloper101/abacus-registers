@@ -1,6 +1,6 @@
 # Heliod peripheral API cost checking
 
-Costs use the existing DSL and integer `usize` values:
+Costs use the existing DSL. A provider can use integer `usize` values:
 
 - State background cost: `(Off, cost: 1)`.
 - Composite state: `(Active(RxIdle, TxIdle), Idle, cost: 1)`.
@@ -48,14 +48,31 @@ pub fn sample(sensor: SensorRegisters<Off>) -> SensorRegisters<Off> {
 Compilation prints one number per function:
 
 ```text
-Heliod cost for sample: 17
+Heliod cost for sample: 11
 ```
 
-Here the cost is `(1 + 3) + (5 + 2) + (5 + 1)`. No constants, ordered pairs,
-runtime logging, or MMIO execution are added. The original function is emitted
-unchanged; Rust still checks its types and ownership. Cost arithmetic assumes totals fit in `usize`, and checked
+Here the cost is `3 + (5 + 2) + 1`. Transition commands do not charge the
+transitioning peripheral's background cost. No cost constants, ordered pairs, runtime logging, or MMIO execution are
+added. Diagnostic-only constants may be emitted to produce compiler warnings. The
+original function is emitted unchanged; Rust still checks its types and ownership. Cost arithmetic assumes totals fit in `usize`, and checked
 programs are assumed to contain no recursive calls. Reports are emitted when the compiler expands the attribute; Cargo
 may replay cached compiler output without rerunning analysis.
+
+Costs may instead be symbolic identifiers:
+
+```rust
+states = [(Off, cost: off_cost), (On, cost: on_cost)]
+
+#[RegAttributes([On], ReadOnly, cost = read_cost)]
+data: ReadOnly<u32, Task::Register>,
+```
+
+In symbolic mode, compilation prints a sum such as
+`on_cost + read_cost + (off_cost -> on_cost)`. Repeated terms are written with a
+coefficient, and branches use `max(...)` because their symbolic terms cannot be
+ordered during compilation. A transition is represented by its source and target
+state variables. Burn analysis and numeric optimization diagnostics are skipped
+when any selected provider has symbolic costs.
 
 ## API scopes
 
@@ -86,7 +103,9 @@ providers must also have distinct register type names.
 ## Rules and scope
 
 - Background cost is charged once per command using the states at command entry:
-  sum the maximum possible background cost of each peripheral.
+  sum the maximum possible background cost of each peripheral. For a state
+  transition command, omit the transitioning peripheral from this sum; other
+  live peripherals still contribute their background costs.
 - Register operations add their declared cost and apply their existing state
   changes. Forward, backward, cyclic, and self-transitions are all `StateChange`.
 - Branches take the maximum cost and union the possible states per peripheral.
@@ -105,11 +124,37 @@ transient states, async execution, clock changes, and unsupported Rust construct
 produce errors. Generic typestates and type aliases are not resolved. General
 `Option`/`Result` combinators and dynamic dispatch need additional rules.
 
-The implementation has three small responsibilities: `cost/mod.rs` passes metadata
+The implementation separates these responsibilities: `cost/mod.rs` passes metadata
 between macros, `cost/model.rs` reads existing state/register declarations, and
-`cost/checking.rs` walks real Rust API bodies. There is no global macro registry,
+`cost/checking.rs` walks real Rust API bodies. `cost/diagnostics.rs` formats
+explanations of the bounds and emits source-located compiler warnings. There is no global macro registry,
 filesystem lookup, symbolic solver, or second value-type checker.
 
 Heliod checks every statement in an annotated body. Constructor calls follow the
 same rules as other helpers: their bodies must be available in the checked scope
 and use supported constructs. No initialization boundary bypasses analysis.
+
+
+## Branch and state diagnostics
+
+Heliod automatically emits diagnostics during compilation; no opt-in is required.
+
+At a peripheral operation, Heliod reports when the receiver may be in multiple
+states with different background costs. The diagnostic lists those states, names
+the cheapest state in which the operation is permitted, and shows the difference
+between the cheapest and most expensive background costs for that command.
+
+For `if` and generated-state `match` expressions, Heliod compares the states in
+which each arm leaves every peripheral. If one arm can leave a peripheral in a
+more expensive state, the diagnostic lists the resulting states and shows the
+extra background cost that subsequent commands may pay. Branches whose arms end
+at the same cost do not produce this diagnostic.
+
+Helper diagnostics identify the function whose bound is being computed and point
+to the operation or branch in the helper's source. Reports explain potential local
+savings; they do not change code or reduce the reported function bound.
+
+On stable Rust these source-located diagnostics use a generated deprecated constant
+with no runtime work. They therefore follow the `deprecated` lint configuration;
+`-D warnings` promotes them to errors. Run `cargo test --test cost_api` to see both
+kinds of diagnostics in the example.

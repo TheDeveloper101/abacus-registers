@@ -1,18 +1,18 @@
 use crate::{
     macro_input::MacroInput,
-    parsing::{RegisterAttributes, RegisterType, State},
+    parsing::{Cost, RegisterAttributes, RegisterType, State},
 };
 use std::collections::BTreeMap;
 use syn::{spanned::Spanned, DeriveInput, Error, Result};
 
 pub struct StateInfo {
     pub ty: String,
-    pub cost: usize,
+    pub cost: Cost,
     pub transient: bool,
 }
 pub struct Operation {
     pub target: String,
-    pub cost: usize,
+    pub cost: Cost,
     pub transition: bool,
 }
 pub struct Peripheral {
@@ -23,6 +23,14 @@ pub struct Peripheral {
     pub operations: BTreeMap<(String, String), Operation>,
 }
 impl Peripheral {
+    pub fn is_symbolic(&self) -> bool {
+        self.states.values().any(|state| state.cost.is_symbolic())
+            || self
+                .operations
+                .values()
+                .any(|operation| operation.cost.is_symbolic())
+    }
+
     pub fn new(input: MacroInput, item: DeriveInput) -> Result<Self> {
         let mut model = Self {
             registers: format!("{}Registers", input.peripheral_name),
@@ -43,7 +51,7 @@ impl Peripheral {
                     .form_concrete_state_type()
                     .to_string()
                     .replace(' ', ""),
-                cost: state.cost,
+                cost: state.cost.clone(),
                 transient: state.transient,
             };
             if model
@@ -77,7 +85,7 @@ impl Peripheral {
                                 let operation = Operation {
                                     target,
                                     transition,
-                                    cost: attribute.cost,
+                                    cost: attribute.cost.clone(),
                                 };
                                 if model
                                     .operations

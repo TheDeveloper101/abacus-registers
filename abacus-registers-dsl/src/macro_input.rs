@@ -171,7 +171,7 @@ impl MacroInput {
                         state: state.clone(),
                         transient: state_def.transient,
                         state_shortname: state_def.state_shortname.clone(),
-                        cost: state_def.cost,
+                        cost: state_def.cost.clone(),
                     };
                     if has_substates {
                         output.extend(generating::generate_state_conversion_impls_only(
@@ -191,7 +191,7 @@ impl MacroInput {
                         state: state.clone(),
                         transient: state_def.transient,
                         state_shortname: state_def.state_shortname.clone(),
-                        cost: state_def.cost,
+                        cost: state_def.cost.clone(),
                     };
                     output.extend(generating::generate_state_trait_impls_only(
                         &synthetic_state_def,

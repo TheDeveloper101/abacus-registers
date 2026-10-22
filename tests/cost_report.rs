@@ -16,4 +16,5 @@ fn cross_crate_api_prints_a_single_integer_bound() {
         "{stderr}"
     );
     assert!(!stderr.contains("external_read: ("), "{stderr}");
+    assert!(!stderr.contains("Heliod:"), "{stderr}");
 }

@@ -102,8 +102,10 @@ example shown above)
 
 ## Heliod cost checking
 
-States require integer background costs, e.g. `(Off, cost: 1)`. Register attributes
-accept an optional foreground cost, e.g. `#[RegAttributes([Off], ReadOnly, cost = 2)]`.
+States accept integer or symbolic background costs, e.g. `(Off, cost: 1)` or
+`(Off, cost: off_cost)`. Register attributes accept an optional integer or symbolic
+foreground cost, e.g. `#[RegAttributes([Off], ReadOnly, cost = read_cost)]`.
 Annotate real API functions with `#[heliod(PeripheralCost)]` to print their
-cost bounds during compilation. See the [usage guide](abacus-registers-dsl/COST_CHECKING.md)
+cost bounds during compilation. Compiler diagnostics also highlight expensive
+branches and uncertain peripheral states at register operations. See the [usage guide](abacus-registers-dsl/COST_CHECKING.md)
 for helpers, `AbacusCell` drivers, and supported constructs.

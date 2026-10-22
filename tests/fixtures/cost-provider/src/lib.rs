@@ -5,8 +5,10 @@ use abacus_registers::tock_registers::{
     registers::{ReadOnly, ReadWrite, WriteOnly},
 };
 register_bitfields![u32, Data [VALUE OFFSET(0) NUMBITS(1) []]];
-#[process_register_block(peripheral_name="External", register_base_addr=0, states=[(Ready,cost:1)])]
+#[process_register_block(peripheral_name="External", register_base_addr=0, states=[(Ready,cost:1),(Active,cost:5)])]
 struct Registers {
-    #[RegAttributes([Ready],ReadOnly,cost=2)]
+    #[RegAttributes([Ready],StateChange(Active,[Data::VALUE::SET]),cost=0)]
+    activate: WriteOnly<u32, Data::Register>,
+    #[RegAttributes([Ready, Active],ReadOnly,cost=2)]
     data: ReadOnly<u32, Data::Register>,
 }
