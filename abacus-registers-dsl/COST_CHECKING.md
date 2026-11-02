@@ -100,6 +100,52 @@ transition traits and register-access wrapper types are public. Peripheral names
 must be unique within a crate because they name exported metadata macros. Selected
 providers must also have distinct register type names.
 
+## Inferred peripheral states
+
+Omit the state type argument to use state inference:
+
+```rust
+#[heliod(SensorCost)]
+fn sample(sensor: &SensorRegisters) -> u32 {
+    sensor.into_on();
+    let value = sensor.data.get();
+    sensor.into_off();
+    value
+}
+```
+
+Transitions on an inferred register operate in place and return `()`. Heliod starts
+each peripheral in the full set of declared stable states and constructs the
+smallest satisfying input set from operation constraints. A transition constrains
+the preceding state and replaces the current state with its target. At an `if`,
+the input requirements of both arms are intersected and the output states are
+unioned. Function summaries contain the inferred input and output sets, so callers
+apply the callee contract without adding a separate call command.
+
+Because the inferred register has one stable Rust type, drivers may store it
+directly instead of wrapping a generated state enum in `AbacusCell`:
+
+```rust
+struct Driver {
+    registers: SensorRegisters,
+}
+
+#[heliod(SensorCost)]
+impl Driver {
+    fn read(&self) -> u32 {
+        self.registers.into_on();
+        let value = self.registers.data.get();
+        self.registers.into_off();
+        value
+    }
+}
+```
+
+The explicit `SensorRegisters<Off>` typestate API and `AbacusCell` remain available
+for code that is not checked by Heliod or that needs the existing runtime state
+container. Recursive functions and hardware-concurrent transient-state inference
+are outside the sequential fragment.
+
 ## Rules and scope
 
 - Background cost is charged once per command using the states at command entry:

@@ -126,6 +126,52 @@ fn symbolic_branches_report_the_maximum_of_the_arm_expressions() {
     let report = checking::analyze(&item, &[peripheral]).unwrap();
     assert!(report.reported_costs[0].1.contains("max("));
 }
+
+#[test]
+fn state_inference_finds_the_minimal_function_input() {
+    assert_eq!(
+        cost("fn sample(p:&TestRegisters){p.into_start();p.data.get();p.into_off();}"),
+        11
+    );
+    assert_eq!(cost("fn read(p:&TestRegisters){p.data.get();}"), 7);
+}
+
+#[test]
+fn state_inference_propagates_function_contracts() {
+    let reports = check(
+        "mod api{fn activate(p:&TestRegisters){p.into_start();}fn sample(p:&TestRegisters){activate(p);p.data.get();}}",
+    )
+    .unwrap();
+    assert!(reports.contains(&("api::activate".into(), 3)));
+    assert!(reports.contains(&("api::sample".into(), 10)));
+}
+
+#[test]
+fn inferred_function_costs_are_concretized_at_call_sites() {
+    let reports = check(
+        "mod api{fn read(p:&TestRegisters){p.data.get();}fn caller(p:&TestRegisters<Off>){read(p);}}",
+    )
+    .unwrap();
+    assert!(reports.contains(&("api::read".into(), 7)));
+    assert!(reports.contains(&("api::caller".into(), 3)));
+}
+
+#[test]
+fn state_inference_conjoins_branch_requirements() {
+    let error =
+        check("fn impossible(p:&TestRegisters,b:bool){if b{p.into_start();}else{p.into_off();}}")
+            .unwrap_err();
+    assert!(error.to_string().contains("unsatisfiable"));
+}
+
+#[test]
+fn inferred_driver_fields_do_not_need_an_abacus_cell() {
+    let reports = check(
+        "mod api{struct Driver{regs:TestRegisters}impl Driver{fn read(&self){self.regs.into_start();self.regs.data.get();self.regs.into_off();}}}",
+    )
+    .unwrap();
+    assert_eq!(reports, vec![("api::Driver::read".into(), 11)]);
+}
 #[test]
 fn actual_rust_api_costs_follow_state_changes_and_rebinding() {
     assert_eq!(cost("fn sample(p:TestRegisters<Off>)->TestRegisters<Off>{let p=p.into_start();let x=p.data.get();p.into_off()}"),11);

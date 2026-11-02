@@ -109,3 +109,8 @@ Annotate real API functions with `#[heliod(PeripheralCost)]` to print their
 cost bounds during compilation. Compiler diagnostics also highlight expensive
 branches and uncertain peripheral states at register operations. See the [usage guide](abacus-registers-dsl/COST_CHECKING.md)
 for helpers, `AbacusCell` drivers, and supported constructs.
+
+Heliod can infer peripheral states when the generated register type omits its state
+argument. In that form transitions happen in place, so drivers can store the
+register handle directly and do not need `AbacusCell` solely to accommodate a
+changing Rust typestate.

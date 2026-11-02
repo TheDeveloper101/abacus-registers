@@ -15,6 +15,83 @@ pub struct Register {
 }
 
 impl Register {
+    pub fn generate_inferred_bindings(
+        &self,
+        register_name: &Ident,
+        inferred_state: &Ident,
+    ) -> proc_macro2::TokenStream {
+        let width = &self.register_bitwidth;
+        let marker = &self.register_shortname;
+        let field = &self.name;
+        match &self.register_type {
+            RegisterType::ReadOnly => quote! {
+                impl ReadOnlyRegister<#width, #marker, #inferred_state> {
+                    pub fn get(&self) -> #width { self.reg.get() }
+                    pub fn read(&self, field: Field<#width, #marker>) -> #width {
+                        self.reg.read(field)
+                    }
+                }
+            },
+            RegisterType::WriteOnly => quote! {
+                impl WriteOnlyRegister<#width, #marker, #inferred_state> {
+                    pub fn set(&self, value: #width) { self.reg.set(value) }
+                    pub fn write(&self, value: FieldValue<#width, #marker>) {
+                        self.reg.write(value)
+                    }
+                    pub fn modify_no_read(
+                        &self,
+                        original: LocalRegisterCopy<#width, #marker>,
+                        value: FieldValue<#width, #marker>,
+                    ) {
+                        self.reg.modify_no_read(original, value)
+                    }
+                }
+            },
+            RegisterType::ReadWrite => quote! {
+                impl ReadWriteRegister<#width, #marker, #inferred_state> {
+                    pub fn get(&self) -> #width { self.reg.get() }
+                    pub fn set(&self, value: #width) { self.reg.set(value) }
+                    pub fn is_set(&self, field: Field<#width, #marker>) -> bool {
+                        self.reg.is_set(field)
+                    }
+                    pub fn write(&self, value: FieldValue<#width, #marker>) {
+                        self.reg.write(value)
+                    }
+                    pub fn modify(&self, value: FieldValue<#width, #marker>) {
+                        self.reg.modify(value)
+                    }
+                    pub fn modify_no_read(
+                        &self,
+                        original: LocalRegisterCopy<#width, #marker>,
+                        value: FieldValue<#width, #marker>,
+                    ) {
+                        self.reg.modify_no_read(original, value)
+                    }
+                    pub fn read(&self, field: Field<#width, #marker>) -> #width {
+                        self.reg.read(field)
+                    }
+                }
+            },
+            RegisterType::StateChange(_, instructions, shortname) => {
+                let method = shortname
+                    .as_ref()
+                    .unwrap_or_else(|| match &self.register_type {
+                        RegisterType::StateChange(state, _, _) => &state.state_name,
+                        _ => unreachable!(),
+                    });
+                let method = format_ident!("into_{}", method.to_string().to_lowercase());
+                let instructions = instructions.iter();
+                quote! {
+                    impl #register_name<#inferred_state> {
+                        pub fn #method(&self) {
+                            self.#field.reg.modify(#(#instructions)+*);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Create passthrough for valid tock-register operations for each
     /// AbacusRegister type.
     pub fn generate_register_op_bindings(

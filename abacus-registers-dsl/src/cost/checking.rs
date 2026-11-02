@@ -6,7 +6,7 @@ use super::{
 };
 use crate::parsing::Cost;
 use quote::ToTokens;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use syn::{
     spanned::Spanned, Block, Error, Expr, FnArg, GenericArgument, Item, Pat, PathArguments, Result,
     Signature, Stmt, Type,
@@ -25,11 +25,13 @@ enum Value {
 pub(super) struct Device {
     pub(super) model: usize,
     pub(super) states: States,
+    input_states: States,
 }
 #[derive(Clone, Default)]
 struct Context {
     scope: String,
     devices: Vec<Device>,
+    inferred_inputs: VecDeque<(usize, States)>,
     bindings: BTreeMap<String, Value>,
 }
 
@@ -57,6 +59,7 @@ pub struct BackgroundCharge {
     pub device: usize,
     pub states: States,
     pub cost: usize,
+    input_states: States,
 }
 
 #[allow(dead_code)]
@@ -68,6 +71,7 @@ pub struct PeripheralEvent {
     pub target: States,
     pub transition: bool,
     pub cost: usize,
+    source_inputs: States,
     pub span: proc_macro2::Span,
 }
 
@@ -311,6 +315,7 @@ struct Checker<'a> {
     functions: BTreeMap<String, Function>,
     summaries: BTreeMap<String, FunctionAnalysis>,
     structs: BTreeMap<String, BTreeMap<String, Type>>,
+    inferred: BTreeMap<String, super::inference::Contract>,
 }
 
 #[cfg(test)]
@@ -319,6 +324,11 @@ pub fn check(item: &Item, models: &[Peripheral]) -> Result<Vec<(String, usize)>>
 }
 
 pub fn analyze(item: &Item, models: &[Peripheral]) -> Result<Report> {
+    let inferred = if has_inferred_types(item, models) {
+        super::inference::infer(item, models)?
+    } else {
+        BTreeMap::new()
+    };
     let mut checker = Checker {
         function: String::new(),
         diagnostics: Vec::new(),
@@ -326,6 +336,7 @@ pub fn analyze(item: &Item, models: &[Peripheral]) -> Result<Report> {
         functions: BTreeMap::new(),
         summaries: BTreeMap::new(),
         structs: BTreeMap::new(),
+        inferred,
     };
     checker.collect(item, "")?;
     if checker.functions.is_empty() {
@@ -391,6 +402,11 @@ impl Checker<'_> {
                     .map(|(scope, _)| scope)
                     .unwrap_or("")
                     .into(),
+                inferred_inputs: self
+                    .inferred
+                    .get(name)
+                    .map(|contract| contract.inputs.clone().into())
+                    .unwrap_or_default(),
                 ..Context::default()
             };
             let mut parameters = Vec::new();
@@ -562,14 +578,20 @@ impl Checker<'_> {
             return Ok(Value::Cell(id));
         }
         for (index, model) in self.models.iter().enumerate() {
+            let mut requires_inferred_input = false;
             let states = if name == model.registers {
-                let state_type = type_key(type_argument(ty)?)?;
-                let state = model
-                    .states
-                    .iter()
-                    .find(|(_, s)| s.ty == state_type)
-                    .ok_or_else(|| Error::new(ty.span(), "unknown or generic typestate"))?;
-                BTreeSet::from([state.0.clone()])
+                if let Some(argument) = type_argument_optional(ty)? {
+                    let state_type = type_key(argument)?;
+                    let state = model
+                        .states
+                        .iter()
+                        .find(|(_, s)| s.ty == state_type)
+                        .ok_or_else(|| Error::new(ty.span(), "unknown or generic typestate"))?;
+                    BTreeSet::from([state.0.clone()])
+                } else {
+                    requires_inferred_input = true;
+                    model.states.keys().cloned().collect()
+                }
             } else if name == model.state_enum {
                 model.states.keys().cloned().collect()
             } else {
@@ -581,9 +603,20 @@ impl Checker<'_> {
                     "transient states require hardware-concurrency analysis",
                 ));
             }
+            let states = if let Some(inferred) = context.inferred_inputs.pop_front() {
+                if inferred.0 != index {
+                    return Err(Error::new(ty.span(), "inferred peripheral type mismatch"));
+                }
+                inferred.1
+            } else if requires_inferred_input {
+                return Err(Error::new(ty.span(), "missing inferred peripheral input"));
+            } else {
+                states
+            };
             let id = context.devices.len();
             context.devices.push(Device {
                 model: index,
+                input_states: states.clone(),
                 states,
             });
             return Ok(Value::Register(id));
@@ -614,6 +647,7 @@ impl Checker<'_> {
                 device: id,
                 states: device.states.clone(),
                 cost,
+                input_states: device.input_states.clone(),
             });
         }
         charges
@@ -1019,6 +1053,7 @@ impl Checker<'_> {
                 }
             }
             let source = device.states.clone();
+            let source_inputs = device.input_states.clone();
             let operation_cost = cost;
             let mut summaries = Vec::new();
             let mut argument_events = Vec::new();
@@ -1029,6 +1064,9 @@ impl Checker<'_> {
                 argument_events.extend(argument.events);
             }
             context.devices[id].states = targets;
+            if transition {
+                context.devices[id].input_states.clear();
+            }
             let target = context.devices[id].states.clone();
             let mut result = Evaluation::new(
                 if transition {
@@ -1047,6 +1085,7 @@ impl Checker<'_> {
                 target,
                 transition,
                 cost: operation_cost,
+                source_inputs,
                 span: call.span(),
             });
             return Ok(result);
@@ -1169,6 +1208,10 @@ impl Checker<'_> {
             remaining = remaining.difference(&reachable).cloned().collect();
             let mut arm_context = context.clone();
             arm_context.devices[id].states = reachable;
+            let reachable = arm_context.devices[id].states.clone();
+            arm_context.devices[id]
+                .input_states
+                .retain(|state| reachable.contains(state));
             if let Some(pattern) = binding {
                 bind(pattern, Value::Register(id), &mut arm_context)?;
             }
@@ -1267,10 +1310,23 @@ impl Checker<'_> {
             }
         }
 
+        let call_inputs = context.devices.clone();
         let summary =
             self.instantiate_control_flow(&function.summary, &mapped, context, &unique)?;
         for (formal, actual) in function.final_devices.iter().zip(&mapped) {
-            context.devices[*actual].states = formal.states.clone();
+            let input = &call_inputs[*actual];
+            let mut states: States = formal
+                .states
+                .difference(&formal.input_states)
+                .cloned()
+                .collect();
+            states.extend(formal.input_states.intersection(&input.states).cloned());
+            context.devices[*actual].states = states;
+            context.devices[*actual].input_states = formal
+                .input_states
+                .intersection(&input.input_states)
+                .cloned()
+                .collect();
         }
         let value = map_result(&function.result, &mapped, span)?;
         let cost = summary.cost();
@@ -1293,12 +1349,31 @@ impl Checker<'_> {
                     .background
                     .iter()
                     .map(|charge| {
+                        let device = *devices.get(charge.device).ok_or_else(|| {
+                            Error::new(command.span, "invalid summarized peripheral")
+                        })?;
+                        let actual = &context.devices[device];
+                        let mut states: States = charge
+                            .states
+                            .difference(&charge.input_states)
+                            .cloned()
+                            .collect();
+                        states.extend(charge.input_states.intersection(&actual.states).cloned());
+                        let model = &self.models[actual.model];
+                        let cost = states
+                            .iter()
+                            .filter_map(|state| model.states[state].cost.concrete())
+                            .max()
+                            .unwrap_or(0);
                         Ok(BackgroundCharge {
-                            device: *devices.get(charge.device).ok_or_else(|| {
-                                Error::new(command.span, "invalid summarized peripheral")
-                            })?,
-                            states: charge.states.clone(),
-                            cost: charge.cost,
+                            device,
+                            states,
+                            cost,
+                            input_states: charge
+                                .input_states
+                                .intersection(&actual.input_states)
+                                .cloned()
+                                .collect(),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1316,27 +1391,51 @@ impl Checker<'_> {
                             .filter_map(|name| states[name].cost.concrete())
                             .max()
                             .unwrap_or(0),
+                        input_states: state.input_states.clone(),
                     });
                 }
-                let events = command
+                let events: Vec<PeripheralEvent> = command
                     .events
                     .iter()
                     .map(|event| {
+                        let device = *devices.get(event.device).ok_or_else(|| {
+                            Error::new(command.span, "invalid summarized peripheral event")
+                        })?;
+                        let actual = &context.devices[device];
+                        let mut source: States = event
+                            .source
+                            .difference(&event.source_inputs)
+                            .cloned()
+                            .collect();
+                        source.extend(event.source_inputs.intersection(&actual.states).cloned());
+                        let model = &self.models[actual.model];
+                        let cost = source
+                            .iter()
+                            .filter_map(|state| {
+                                model.operations[&(state.clone(), event.operation.clone())]
+                                    .cost
+                                    .concrete()
+                            })
+                            .max()
+                            .unwrap_or(0);
                         Ok(PeripheralEvent {
-                            device: *devices.get(event.device).ok_or_else(|| {
-                                Error::new(command.span, "invalid summarized peripheral event")
-                            })?,
+                            device,
                             operation: event.operation.clone(),
-                            source: event.source.clone(),
+                            source,
                             target: event.target.clone(),
                             transition: event.transition,
-                            cost: event.cost,
+                            cost,
+                            source_inputs: event
+                                .source_inputs
+                                .intersection(&actual.input_states)
+                                .cloned()
+                                .collect(),
                             span: event.span,
                         })
                     })
                     .collect::<Result<_>>()?;
                 ControlFlowSummary::Command(CommandSummary {
-                    foreground: command.foreground,
+                    foreground: events.iter().map(|event| event.cost).sum(),
                     background,
                     events,
                     span: command.span,
@@ -1483,6 +1582,9 @@ fn join_context(left: &Context, right: &Context) -> Result<Context> {
     let mut joined = left.clone();
     for (device, other) in joined.devices.iter_mut().zip(&right.devices) {
         device.states.extend(other.states.iter().cloned());
+        device
+            .input_states
+            .extend(other.input_states.iter().cloned());
     }
     joined
         .bindings
@@ -1520,6 +1622,46 @@ fn type_name(ty: &Type) -> Result<String> {
     }
     Err(Error::new(ty.span(), "unsupported type"))
 }
+
+fn has_inferred_types(item: &Item, models: &[Peripheral]) -> bool {
+    fn inferred_type(ty: &Type, models: &[Peripheral]) -> bool {
+        match ty {
+            Type::Reference(reference) => inferred_type(&reference.elem, models),
+            Type::Tuple(tuple) => tuple.elems.iter().any(|ty| inferred_type(ty, models)),
+            Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+                models.iter().any(|model| {
+                    segment.ident == model.registers
+                        && matches!(segment.arguments, PathArguments::None)
+                })
+            }),
+            _ => false,
+        }
+    }
+    fn signature(signature: &Signature, models: &[Peripheral]) -> bool {
+        signature.inputs.iter().any(|argument| match argument {
+            FnArg::Typed(argument) => inferred_type(&argument.ty, models),
+            FnArg::Receiver(_) => false,
+        }) || match &signature.output {
+            syn::ReturnType::Default => false,
+            syn::ReturnType::Type(_, ty) => inferred_type(ty, models),
+        }
+    }
+    match item {
+        Item::Fn(function) => signature(&function.sig, models),
+        Item::Impl(implementation) => implementation.items.iter().any(
+            |item| matches!(item, syn::ImplItem::Fn(function) if signature(&function.sig, models)),
+        ),
+        Item::Mod(module) => module
+            .content
+            .as_ref()
+            .is_some_and(|(_, items)| items.iter().any(|item| has_inferred_types(item, models))),
+        Item::Struct(item) => item
+            .fields
+            .iter()
+            .any(|field| inferred_type(&field.ty, models)),
+        _ => false,
+    }
+}
 fn type_argument(ty: &Type) -> Result<&Type> {
     if let Type::Path(path) = ty {
         if let PathArguments::AngleBracketed(args) = &path
@@ -1535,6 +1677,25 @@ fn type_argument(ty: &Type) -> Result<&Type> {
         }
     }
     Err(Error::new(ty.span(), "expected a concrete type argument"))
+}
+
+fn type_argument_optional(ty: &Type) -> Result<Option<&Type>> {
+    if let Type::Path(path) = ty {
+        let segment = path
+            .path
+            .segments
+            .last()
+            .ok_or_else(|| Error::new_spanned(&path.path, "expected a nonempty path"))?;
+        return match &segment.arguments {
+            PathArguments::None => Ok(None),
+            PathArguments::AngleBracketed(arguments) => match arguments.args.first() {
+                Some(GenericArgument::Type(ty)) => Ok(Some(ty)),
+                _ => Err(Error::new(arguments.span(), "expected a type argument")),
+            },
+            _ => Err(Error::new(segment.span(), "unsupported type arguments")),
+        };
+    }
+    Err(Error::new(ty.span(), "unsupported type"))
 }
 fn type_key(ty: &Type) -> Result<String> {
     if let Type::Path(path) = ty {

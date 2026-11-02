@@ -2,6 +2,7 @@
 mod burn;
 mod checking;
 mod diagnostics;
+mod inference;
 mod model;
 
 use proc_macro2::TokenStream;

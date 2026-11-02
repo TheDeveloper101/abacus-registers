@@ -53,9 +53,14 @@ fn expand_register_block(
     let register = format_ident!("{}Registers", parsed_input.peripheral_name);
     let internal_register = format_ident!("Block");
     let state_enum_ident = format_ident!("{}StateEnum", parsed_input.peripheral_name);
+    let inferred_state_ident = format_ident!("{}InferredState", parsed_input.peripheral_name);
 
     let mut result = add_imports();
-    result.extend(generate_register_wrapper(&register, &internal_register));
+    result.extend(generate_register_wrapper(
+        &register,
+        &internal_register,
+        &inferred_state_ident,
+    ));
     result.extend(generate_state_enum(
         &parsed_input.state_definitions,
         &register,
@@ -77,7 +82,11 @@ fn expand_register_block(
     };
 
     let (field_details, reg_vec) = process_struct_fields(&data.fields)?;
-    result.extend(generate_register_bindings(&reg_vec, &register)?);
+    result.extend(generate_register_bindings(
+        &reg_vec,
+        &register,
+        &inferred_state_ident,
+    )?);
     result.extend(register_type_definitions());
     result.extend(quote! {
         #[repr(C)]
@@ -109,9 +118,13 @@ fn add_imports() -> proc_macro2::TokenStream {
 fn generate_register_wrapper(
     register: &syn::Ident,
     internal_register: &syn::Ident,
+    inferred_state: &syn::Ident,
 ) -> proc_macro2::TokenStream {
     quote! {
-        pub struct #register<S: State> {
+        pub struct #inferred_state;
+        impl State for #inferred_state {}
+
+        pub struct #register<S: State = #inferred_state> {
             reg:  AbacusStaticRef<#internal_register<S>>,
         }
 
@@ -261,6 +274,7 @@ fn process_field(field: &Field) -> syn::Result<(proc_macro2::TokenStream, Vec<Re
 fn generate_register_bindings(
     reg_vec: &[Register],
     register: &syn::Ident,
+    inferred_state: &syn::Ident,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let mut result = proc_macro2::TokenStream::new();
     let mut seen = HashSet::new();
@@ -268,6 +282,10 @@ fn generate_register_bindings(
         let binding = reg.generate_register_op_bindings(register)?;
         if seen.insert(binding.clone().to_string()) {
             result.extend(binding);
+        }
+        let inferred = reg.generate_inferred_bindings(register, inferred_state);
+        if seen.insert(inferred.clone().to_string()) {
+            result.extend(inferred);
         }
     }
     Ok(result)

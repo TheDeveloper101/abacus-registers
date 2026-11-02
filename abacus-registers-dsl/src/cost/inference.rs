@@ -1,0 +1,757 @@
+//! State inference for the sequential Heliod fragment.
+//!
+//! This is the finite-state implementation of the paper's inference judgments:
+//! inputs start at top, operations add subset constraints, transitions replace the
+//! current state, branch requirements are conjoined and branch results are joined,
+//! and calls apply the inferred input/output sets of the callee.
+
+use super::model::Peripheral;
+use quote::ToTokens;
+use std::collections::{BTreeMap, BTreeSet};
+use syn::{
+    spanned::Spanned, Block, Error, Expr, FnArg, GenericArgument, Item, Pat, PathArguments, Result,
+    Signature, Stmt, Type,
+};
+
+type States = BTreeSet<String>;
+
+#[derive(Clone, PartialEq, Eq)]
+enum Value {
+    Scalar,
+    Register(usize),
+    Tuple(Vec<Value>),
+    Object(String, BTreeMap<String, Value>),
+}
+
+#[derive(Clone)]
+enum StateExpression {
+    Input(usize),
+    Known(States),
+    Union(Vec<StateExpression>),
+}
+
+#[derive(Clone)]
+struct Device {
+    model: usize,
+    state: StateExpression,
+}
+
+#[derive(Clone, Default)]
+struct Context {
+    scope: String,
+    devices: Vec<Device>,
+    inputs: Vec<States>,
+    bindings: BTreeMap<String, Value>,
+}
+
+#[derive(Clone)]
+struct Function {
+    signature: Signature,
+    body: Block,
+    owner: Option<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct Contract {
+    parameters: Vec<Value>,
+    pub(super) inputs: Vec<(usize, States)>,
+    outputs: Vec<(usize, States)>,
+    result: Value,
+}
+
+pub(super) fn infer(item: &Item, models: &[Peripheral]) -> Result<BTreeMap<String, Contract>> {
+    let mut checker = Checker {
+        models,
+        functions: BTreeMap::new(),
+        contracts: BTreeMap::new(),
+        structs: BTreeMap::new(),
+        active: BTreeSet::new(),
+    };
+    checker.collect(item, "")?;
+    let names = checker.functions.keys().cloned().collect::<Vec<_>>();
+    for name in names {
+        checker.summarize(&name)?;
+    }
+    Ok(checker.contracts)
+}
+
+struct Checker<'a> {
+    models: &'a [Peripheral],
+    functions: BTreeMap<String, Function>,
+    contracts: BTreeMap<String, Contract>,
+    structs: BTreeMap<String, BTreeMap<String, Type>>,
+    active: BTreeSet<String>,
+}
+
+impl Checker<'_> {
+    fn collect(&mut self, item: &Item, scope: &str) -> Result<()> {
+        match item {
+            Item::Fn(function) => self.add_function(scope, &function.sig, &function.block, None)?,
+            Item::Impl(implementation) => {
+                let owner = qualify(scope, &type_name(&implementation.self_ty)?);
+                for item in &implementation.items {
+                    if let syn::ImplItem::Fn(function) = item {
+                        self.add_function(
+                            &owner,
+                            &function.sig,
+                            &function.block,
+                            Some(owner.clone()),
+                        )?;
+                    }
+                }
+            }
+            Item::Mod(module) => {
+                let Some((_, items)) = &module.content else {
+                    return Err(Error::new(item.span(), "the checked module must be inline"));
+                };
+                let scope = qualify(scope, &module.ident.to_string());
+                for item in items {
+                    self.collect(item, &scope)?;
+                }
+            }
+            Item::Struct(item) => {
+                let mut fields = BTreeMap::new();
+                for field in &item.fields {
+                    let name = field
+                        .ident
+                        .as_ref()
+                        .ok_or_else(|| Error::new(field.span(), "expected named fields"))?;
+                    fields.insert(name.to_string(), field.ty.clone());
+                }
+                self.structs
+                    .insert(qualify(scope, &item.ident.to_string()), fields);
+            }
+            Item::Use(_) => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn add_function(
+        &mut self,
+        scope: &str,
+        signature: &Signature,
+        body: &Block,
+        owner: Option<String>,
+    ) -> Result<()> {
+        let name = qualify(scope, &signature.ident.to_string());
+        self.functions.insert(
+            name,
+            Function {
+                signature: signature.clone(),
+                body: body.clone(),
+                owner,
+            },
+        );
+        Ok(())
+    }
+
+    fn summarize(&mut self, name: &str) -> Result<()> {
+        if self.contracts.contains_key(name) {
+            return Ok(());
+        }
+        if !self.active.insert(name.to_owned()) {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                "recursive functions are not supported by state inference",
+            ));
+        }
+        let function = self
+            .functions
+            .get(name)
+            .cloned()
+            .ok_or_else(|| failure("unknown function"))?;
+        let result = (|| {
+            let mut context = Context {
+                scope: name
+                    .rsplit_once("::")
+                    .map(|(scope, _)| scope)
+                    .unwrap_or("")
+                    .into(),
+                ..Context::default()
+            };
+            let mut parameters = Vec::new();
+            for parameter in &function.signature.inputs {
+                let value = match parameter {
+                    FnArg::Typed(parameter) => {
+                        let value = self.initial(&parameter.ty, &mut context)?;
+                        bind(&parameter.pat, value.clone(), &mut context)?;
+                        value
+                    }
+                    FnArg::Receiver(_) => {
+                        let mut fields = BTreeMap::new();
+                        for (field, ty) in function
+                            .owner
+                            .as_ref()
+                            .and_then(|owner| self.structs.get(owner))
+                            .cloned()
+                            .unwrap_or_default()
+                        {
+                            fields.insert(field, self.initial(&ty, &mut context)?);
+                        }
+                        let value =
+                            Value::Object(function.owner.clone().unwrap_or_default(), fields);
+                        context.bindings.insert("self".into(), value.clone());
+                        value
+                    }
+                };
+                parameters.push(value);
+            }
+            let value = self.block(&function.body, &mut context)?;
+            let inputs = context
+                .devices
+                .iter()
+                .enumerate()
+                .map(|(id, device)| (device.model, context.inputs[id].clone()))
+                .collect();
+            let outputs = context
+                .devices
+                .iter()
+                .map(|device| (device.model, possible(&device.state, &context.inputs)))
+                .collect();
+            self.contracts.insert(
+                name.to_owned(),
+                Contract {
+                    parameters,
+                    inputs,
+                    outputs,
+                    result: value,
+                },
+            );
+            Ok(())
+        })();
+        self.active.remove(name);
+        result
+    }
+
+    fn initial(&self, ty: &Type, context: &mut Context) -> Result<Value> {
+        if let Type::Reference(reference) = ty {
+            return self.initial(&reference.elem, context);
+        }
+        if let Type::Tuple(tuple) = ty {
+            return Ok(Value::Tuple(
+                tuple
+                    .elems
+                    .iter()
+                    .map(|ty| self.initial(ty, context))
+                    .collect::<Result<_>>()?,
+            ));
+        }
+        let name = type_name(ty)?;
+        if is_scalar(&name) {
+            return Ok(Value::Scalar);
+        }
+        for (model_index, model) in self.models.iter().enumerate() {
+            let states = if name == model.registers {
+                match type_argument_optional(ty)? {
+                    None => model.states.keys().cloned().collect(),
+                    Some(argument) => {
+                        let key = type_key(argument)?;
+                        let state = model
+                            .states
+                            .iter()
+                            .find(|(_, state)| state.ty == key)
+                            .ok_or_else(|| Error::new(ty.span(), "unknown typestate"))?;
+                        BTreeSet::from([state.0.clone()])
+                    }
+                }
+            } else if name == model.state_enum {
+                model.states.keys().cloned().collect()
+            } else {
+                continue;
+            };
+            let id = context.devices.len();
+            context.inputs.push(states);
+            context.devices.push(Device {
+                model: model_index,
+                state: StateExpression::Input(id),
+            });
+            return Ok(Value::Register(id));
+        }
+        Err(Error::new(
+            ty.span(),
+            "unmodeled parameter or field type; select its cost provider",
+        ))
+    }
+
+    fn block(&mut self, block: &Block, context: &mut Context) -> Result<Value> {
+        let bindings = context.bindings.clone();
+        let mut result = Value::Scalar;
+        for statement in &block.stmts {
+            result = match statement {
+                Stmt::Local(local) => {
+                    let initializer = local
+                        .init
+                        .as_ref()
+                        .ok_or_else(|| Error::new(local.span(), "expected an initialized local"))?;
+                    let value = self.expression(&initializer.expr, context)?;
+                    bind(&local.pat, value, context)?;
+                    Value::Scalar
+                }
+                Stmt::Expr(expression, semicolon) => {
+                    let value = self.expression(expression, context)?;
+                    if semicolon.is_some() {
+                        Value::Scalar
+                    } else {
+                        value
+                    }
+                }
+                _ => return Err(Error::new(statement.span(), "unsupported statement")),
+            };
+        }
+        context.bindings = bindings;
+        Ok(result)
+    }
+
+    fn expression(&mut self, expression: &Expr, context: &mut Context) -> Result<Value> {
+        match expression {
+            Expr::Path(_) | Expr::Field(_) => lookup(expression, context),
+            Expr::Lit(_) => Ok(Value::Scalar),
+            Expr::Reference(reference) => self.expression(&reference.expr, context),
+            Expr::Paren(parenthesized) => self.expression(&parenthesized.expr, context),
+            Expr::Block(block) => self.block(&block.block, context),
+            Expr::Return(result) => result
+                .expr
+                .as_ref()
+                .map_or(Ok(Value::Scalar), |value| self.expression(value, context)),
+            Expr::Tuple(tuple) => Ok(Value::Tuple(
+                tuple
+                    .elems
+                    .iter()
+                    .map(|value| self.expression(value, context))
+                    .collect::<Result<_>>()?,
+            )),
+            Expr::Unary(unary) => self.expression(&unary.expr, context),
+            Expr::Binary(binary) => {
+                self.expression(&binary.left, context)?;
+                self.expression(&binary.right, context)?;
+                Ok(Value::Scalar)
+            }
+            Expr::If(branch) => {
+                self.expression(&branch.cond, context)?;
+                let before = context.clone();
+                let mut left = before.clone();
+                let left_value = self.block(&branch.then_branch, &mut left)?;
+                let mut right = before;
+                let right_value = if let Some((_, expression)) = &branch.else_branch {
+                    self.expression(expression, &mut right)?
+                } else {
+                    Value::Scalar
+                };
+                if left_value != right_value {
+                    return Err(Error::new(
+                        branch.span(),
+                        "branches return different peripheral identities",
+                    ));
+                }
+                *context = join(left, right)?;
+                Ok(left_value)
+            }
+            Expr::MethodCall(call) => self.method(call, context),
+            Expr::Call(call) => {
+                let Expr::Path(path) = call.func.as_ref() else {
+                    return Err(Error::new(call.span(), "indirect calls are unsupported"));
+                };
+                let name = path
+                    .path
+                    .segments
+                    .last()
+                    .ok_or_else(|| Error::new(path.span(), "expected function name"))?
+                    .ident
+                    .to_string();
+                let values = call
+                    .args
+                    .iter()
+                    .map(|argument| self.expression(argument, context))
+                    .collect::<Result<Vec<_>>>()?;
+                if matches!(name.as_str(), "Ok" | "Err" | "Some") {
+                    return Ok(Value::Scalar);
+                }
+                let requested = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                self.call(&requested, values, context, call.span())
+            }
+            _ => Err(Error::new(
+                expression.span(),
+                "unsupported expression in state inference",
+            )),
+        }
+    }
+
+    fn method(&mut self, call: &syn::ExprMethodCall, context: &mut Context) -> Result<Value> {
+        let name = call.method.to_string();
+        if name == "into" && call.args.is_empty() {
+            return self.expression(&call.receiver, context);
+        }
+        let (receiver, operation) = match call.receiver.as_ref() {
+            Expr::Field(field)
+                if !matches!(lookup(&call.receiver, context), Ok(Value::Register(_))) =>
+            {
+                let syn::Member::Named(field_name) = &field.member else {
+                    return Err(Error::new(field.span(), "expected named register field"));
+                };
+                (field.base.as_ref(), format!("{field_name}.{name}"))
+            }
+            _ => (call.receiver.as_ref(), name.clone()),
+        };
+        if let Ok(Value::Register(id)) = lookup(receiver, context) {
+            for argument in &call.args {
+                self.expression(argument, context)?;
+            }
+            let model = &self.models[context.devices[id].model];
+            let allowed = model
+                .operations
+                .keys()
+                .filter(|(_, candidate)| candidate == &operation)
+                .map(|(state, _)| state.clone())
+                .collect::<States>();
+            if allowed.is_empty() {
+                return Err(Error::new(call.span(), "unknown peripheral operation"));
+            }
+            restrict(
+                &context.devices[id].state,
+                &allowed,
+                &mut context.inputs,
+                call.span(),
+            )?;
+            let sources = possible(&context.devices[id].state, &context.inputs);
+            let mut targets = States::new();
+            let mut transition = false;
+            for source in sources {
+                let operation = &model.operations[&(source, operation.clone())];
+                targets.insert(operation.target.clone());
+                transition |= operation.transition;
+            }
+            if transition {
+                context.devices[id].state = StateExpression::Known(targets);
+                Ok(Value::Register(id))
+            } else {
+                Ok(Value::Scalar)
+            }
+        } else if let Ok(Value::Object(owner, fields)) = lookup(&call.receiver, context) {
+            let mut values = vec![Value::Object(owner.clone(), fields)];
+            for argument in &call.args {
+                values.push(self.expression(argument, context)?);
+            }
+            self.call(&qualify(&owner, &name), values, context, call.span())
+        } else {
+            Err(Error::new(call.span(), "unknown method in state inference"))
+        }
+    }
+
+    fn call(
+        &mut self,
+        requested: &str,
+        arguments: Vec<Value>,
+        context: &mut Context,
+        span: proc_macro2::Span,
+    ) -> Result<Value> {
+        let name = resolve(&context.scope, requested, &self.functions);
+        self.summarize(&name)?;
+        let contract = self.contracts[&name].clone();
+        if contract.parameters.len() != arguments.len() {
+            return Err(Error::new(span, "helper argument count mismatch"));
+        }
+        let mut mapped = vec![None; contract.inputs.len()];
+        for (formal, actual) in contract.parameters.iter().zip(&arguments) {
+            map_argument(formal, actual, &mut mapped, span)?;
+        }
+        let mapped = mapped
+            .into_iter()
+            .map(|device| device.ok_or_else(|| Error::new(span, "unmapped peripheral argument")))
+            .collect::<Result<Vec<_>>>()?;
+        for (formal, actual) in contract.inputs.iter().zip(&mapped) {
+            if context.devices[*actual].model != formal.0 {
+                return Err(Error::new(span, "peripheral argument type mismatch"));
+            }
+            restrict(
+                &context.devices[*actual].state,
+                &formal.1,
+                &mut context.inputs,
+                span,
+            )?;
+        }
+        for (formal, actual) in contract.outputs.iter().zip(&mapped) {
+            context.devices[*actual].state = StateExpression::Known(formal.1.clone());
+        }
+        map_result(&contract.result, &mapped, span)
+    }
+}
+
+fn possible(expression: &StateExpression, inputs: &[States]) -> States {
+    match expression {
+        StateExpression::Input(id) => inputs[*id].clone(),
+        StateExpression::Known(states) => states.clone(),
+        StateExpression::Union(parts) => parts
+            .iter()
+            .flat_map(|part| possible(part, inputs))
+            .collect(),
+    }
+}
+
+fn restrict(
+    expression: &StateExpression,
+    allowed: &States,
+    inputs: &mut [States],
+    span: proc_macro2::Span,
+) -> Result<()> {
+    match expression {
+        StateExpression::Input(id) => {
+            inputs[*id] = inputs[*id].intersection(allowed).cloned().collect();
+            if inputs[*id].is_empty() {
+                return Err(Error::new(
+                    span,
+                    "peripheral state constraints are unsatisfiable",
+                ));
+            }
+        }
+        StateExpression::Known(states) => {
+            if !states.is_subset(allowed) {
+                return Err(Error::new(
+                    span,
+                    format!(
+                        "operation is unavailable from inferred states: {}",
+                        states
+                            .difference(allowed)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+        }
+        StateExpression::Union(parts) => {
+            for part in parts {
+                restrict(part, allowed, inputs, span)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn join(left: Context, right: Context) -> Result<Context> {
+    if left.devices.len() != right.devices.len() {
+        return Err(failure("branches change peripheral identities"));
+    }
+    let mut joined = left.clone();
+    for ((device, other), (input, other_input)) in joined
+        .devices
+        .iter_mut()
+        .zip(&right.devices)
+        .zip(joined.inputs.iter_mut().zip(&right.inputs))
+    {
+        if device.model != other.model {
+            return Err(failure("branches change peripheral types"));
+        }
+        device.state = StateExpression::Union(vec![device.state.clone(), other.state.clone()]);
+        *input = input.intersection(other_input).cloned().collect();
+        if input.is_empty() {
+            return Err(failure("branch state constraints are unsatisfiable"));
+        }
+    }
+    joined
+        .bindings
+        .retain(|name, value| right.bindings.get(name) == Some(value));
+    Ok(joined)
+}
+
+fn lookup(expression: &Expr, context: &Context) -> Result<Value> {
+    match expression {
+        Expr::Path(path) if path.path.segments.len() == 1 => context
+            .bindings
+            .get(&path.path.segments[0].ident.to_string())
+            .cloned()
+            .ok_or_else(|| Error::new(path.span(), "unknown binding")),
+        Expr::Field(field) => {
+            let Value::Object(_, fields) = lookup(&field.base, context)? else {
+                return Err(Error::new(field.span(), "expected object field"));
+            };
+            let syn::Member::Named(name) = &field.member else {
+                return Err(Error::new(field.span(), "expected named field"));
+            };
+            fields
+                .get(&name.to_string())
+                .cloned()
+                .ok_or_else(|| Error::new(field.span(), "unknown field"))
+        }
+        Expr::Paren(value) => lookup(&value.expr, context),
+        _ => Err(Error::new(expression.span(), "expected a named receiver")),
+    }
+}
+
+fn bind(pattern: &Pat, value: Value, context: &mut Context) -> Result<()> {
+    match pattern {
+        Pat::Ident(pattern) => {
+            context.bindings.insert(pattern.ident.to_string(), value);
+            Ok(())
+        }
+        Pat::Wild(_) => Ok(()),
+        Pat::Type(pattern) => bind(&pattern.pat, value, context),
+        Pat::Tuple(pattern) => {
+            let Value::Tuple(values) = value else {
+                return Err(Error::new(pattern.span(), "tuple binding mismatch"));
+            };
+            if values.len() != pattern.elems.len() {
+                return Err(Error::new(pattern.span(), "tuple binding mismatch"));
+            }
+            for (pattern, value) in pattern.elems.iter().zip(values) {
+                bind(pattern, value, context)?;
+            }
+            Ok(())
+        }
+        _ => Err(Error::new(pattern.span(), "unsupported binding")),
+    }
+}
+
+fn map_argument(
+    formal: &Value,
+    actual: &Value,
+    devices: &mut [Option<usize>],
+    span: proc_macro2::Span,
+) -> Result<()> {
+    match (formal, actual) {
+        (Value::Scalar, Value::Scalar) => Ok(()),
+        (Value::Register(formal), Value::Register(actual)) => {
+            match devices[*formal] {
+                Some(existing) if existing != *actual => {
+                    return Err(Error::new(span, "inconsistent peripheral mapping"))
+                }
+                _ => devices[*formal] = Some(*actual),
+            }
+            Ok(())
+        }
+        (Value::Tuple(formal), Value::Tuple(actual)) if formal.len() == actual.len() => {
+            for (formal, actual) in formal.iter().zip(actual) {
+                map_argument(formal, actual, devices, span)?;
+            }
+            Ok(())
+        }
+        (Value::Object(formal_owner, formal), Value::Object(actual_owner, actual))
+            if formal_owner == actual_owner =>
+        {
+            for (name, formal) in formal {
+                map_argument(formal, &actual[name], devices, span)?;
+            }
+            Ok(())
+        }
+        _ => Err(Error::new(span, "helper argument type mismatch")),
+    }
+}
+
+fn map_result(value: &Value, devices: &[usize], span: proc_macro2::Span) -> Result<Value> {
+    Ok(match value {
+        Value::Scalar => Value::Scalar,
+        Value::Register(id) => Value::Register(
+            *devices
+                .get(*id)
+                .ok_or_else(|| Error::new(span, "invalid peripheral result"))?,
+        ),
+        Value::Tuple(values) => Value::Tuple(
+            values
+                .iter()
+                .map(|value| map_result(value, devices, span))
+                .collect::<Result<_>>()?,
+        ),
+        Value::Object(owner, fields) => Value::Object(
+            owner.clone(),
+            fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), map_result(value, devices, span)?)))
+                .collect::<Result<_>>()?,
+        ),
+    })
+}
+
+fn resolve(scope: &str, requested: &str, functions: &BTreeMap<String, Function>) -> String {
+    if let Some(method) = requested.strip_prefix("Self::") {
+        return qualify(scope, method);
+    }
+    let mut scope = scope;
+    loop {
+        let candidate = qualify(scope, requested.trim_start_matches("crate::"));
+        if functions.contains_key(&candidate) || scope.is_empty() {
+            return candidate;
+        }
+        scope = scope
+            .rsplit_once("::")
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+    }
+}
+
+fn type_name(ty: &Type) -> Result<String> {
+    let Type::Path(path) = ty else {
+        return Err(Error::new(ty.span(), "unsupported type"));
+    };
+    Ok(path
+        .path
+        .segments
+        .last()
+        .ok_or_else(|| Error::new(ty.span(), "expected type name"))?
+        .ident
+        .to_string())
+}
+
+fn type_argument_optional(ty: &Type) -> Result<Option<&Type>> {
+    let Type::Path(path) = ty else {
+        return Err(Error::new(ty.span(), "unsupported type"));
+    };
+    let segment = path
+        .path
+        .segments
+        .last()
+        .ok_or_else(|| Error::new(ty.span(), "expected type name"))?;
+    match &segment.arguments {
+        PathArguments::None => Ok(None),
+        PathArguments::AngleBracketed(arguments) => match arguments.args.first() {
+            Some(GenericArgument::Type(ty)) => Ok(Some(ty)),
+            _ => Err(Error::new(arguments.span(), "expected a type argument")),
+        },
+        _ => Err(Error::new(segment.span(), "unsupported type arguments")),
+    }
+}
+
+fn type_key(ty: &Type) -> Result<String> {
+    if matches!(ty, Type::Path(_)) {
+        Ok(ty.to_token_stream().to_string().replace(' ', ""))
+    } else {
+        Err(Error::new(ty.span(), "unsupported typestate"))
+    }
+}
+
+fn is_scalar(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "()"
+    )
+}
+
+fn qualify(scope: &str, name: &str) -> String {
+    if scope.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{scope}::{name}")
+    }
+}
+
+fn failure(message: &str) -> Error {
+    Error::new(proc_macro2::Span::call_site(), message)
+}
