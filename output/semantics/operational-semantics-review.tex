@@ -1,0 +1,326 @@
+\documentclass[11pt]{article}
+\usepackage[margin=0.8in]{geometry}
+\usepackage{amsmath,amssymb,mathpartir}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[hidelinks]{hyperref}
+\newcommand{\m}[1]{\operatorname{#1}}
+\title{Operational Semantics}
+\author{}
+\date{}
+\begin{document}
+\maketitle
+\vspace{-2em}
+
+\section{Notation}
+We retain $\Sigma=(M,P,C,S,K,T)$, with $K\in\mathbb{Q}_{>0}$ and
+$T\in\mathbb{Q}_{\geq0}$. The ordinary source await is unstarted; its runtime
+form $\text{await}^{\bullet}$ has an active timer. The existing frame grammar
+includes $(tid:p,[];c)$ and $(tid:p,\text{let }x=[])$ for sequence and return
+continuations. Expressions retain their small-step rules; $\rightarrow^*$
+means complete expression evaluation, including zero steps for values.
+
+$\m{bg}(S)(K)$ is the total background resource cost for one computational
+step at clock $K$. At runtime $S$ contains all peripherals. Thus it includes
+both the known background peripherals and those represented symbolically by
+$\m{cost}(\cdot)$ at a function call site; the latter is not command overhead.
+All resource labels below use the draft's clock-scaling convention.
+
+\section{Expressions and sequential commands}
+\begin{mathpar}
+\inferrule*[left=E-Var]
+{ M(x) = v }
+{ M, S \vdash x \rightarrow v }
+
+\inferrule*[left=E-BinopStep]
+{ M, S \vdash e_1 \rightarrow e'_1 }
+{ M, S \vdash e_1 \text{ binop } e_2 \rightarrow e'_1 \text{ binop } e_2 }
+
+\inferrule*[left=E-BinopStep2]
+{ M, S \vdash e_2 \rightarrow e'_2 }
+{ M, S \vdash v_1 \text{ binop } e_2 \rightarrow v_1 \text{ binop } e'_2 }
+
+\inferrule*[left=E-BinopFin]
+{ v_1 \text{ binop } v_2 = v }
+{ M, S \vdash v_1 \text{ binop } v_2 \rightarrow v }
+
+\inferrule*[left=E-Seq]
+{ q = 0 }
+{
+(M,P,(tid:p,c_1;c_2)::C,S,K) \rightsquigarrow_q
+(M,P,(tid:p,c_1)::(tid:p,[];c_2)::C,S,K)
+}
+
+\inferrule*[left=E-SeqDone]
+{ q = 0 }
+{
+(M,P,(tid:p,\text{skip})::(tid:p,[];c_2)::C,S,K) \rightsquigarrow_q
+(M,P,(tid:p,c_2)::C,S,K)
+}
+
+\inferrule*[left=E-Call]
+{
+M,S \vdash e_a \rightarrow^* v \\
+\m{body}(M(f),v,p) = (c';\text{ret}:=e) \\
+C' = (tid:r,\text{let }x=[])::C \\ q = 0
+}
+{
+(M,P,(tid:r,\text{let }x=f(e_a,p))::C,S,K) \rightsquigarrow_q
+(M,P,(tid:r,c';\text{ret}:=e)::C',S,K)
+}
+
+\inferrule*[left=E-Ret]
+{ M,S \vdash e \rightarrow^* v \\ C = (tid:p,\text{let }x=[])::C' \\ q = 0 }
+{
+(M,P,(tid:p,\text{ret}:=e)::C,S,K) \rightsquigarrow_q
+(M[x\mapsto v],P,(tid:p,\text{skip})::C',S,K)
+}
+
+\inferrule*[left=E-IfTrue]
+{
+M,S \vdash e \rightarrow^* \text{true} \\
+C' = (tid:p,c_1)::(tid:p,\texttt{endif})::C \\ q = \m{bg}(S)(K)
+}
+{
+(M,P,(tid:p,\text{if }e\text{ then }c_1\text{ else }c_2)::C,S,K)
+\rightsquigarrow_q (M,P,C',S,K)
+}
+
+\inferrule*[left=E-IfFalse]
+{
+M,S \vdash e \rightarrow^* \text{false} \\
+C' = (tid:p,c_2)::(tid:p,\texttt{endif})::C \\ q = \m{bg}(S)(K)
+}
+{
+(M,P,(tid:p,\text{if }e\text{ then }c_1\text{ else }c_2)::C,S,K)
+\rightsquigarrow_q (M,P,C',S,K)
+}
+
+\inferrule*[left=E-EndIf]
+{ q = 0 }
+{
+(M,P,(tid:p,\text{skip})::(tid:p,\texttt{endif})::C,S,K) \rightsquigarrow_q
+(M,P,(tid:p,\text{skip})::C,S,K)
+}
+
+\inferrule*[left=E-Assign]
+{ M,S \vdash e \rightarrow^* v \\ q = \m{bg}(S)(K) }
+{
+(M,P,(tid:p,\text{let }x=e)::C,S,K) \rightsquigarrow_q
+(M[x\mapsto v],P,(tid:p,\text{skip})::C,S,K)
+}
+\end{mathpar}
+
+The sequence rules use the continuation frame already present in the draft,
+so calls and branches may push frames without losing the following command.
+$\m{body}$ instantiates the stored function's formal parameters with $v,p$
+capture-avoidingly and freshens its locals. Call entry and return copying are
+free administrative steps, retaining the original convention. The expression
+rules do not separately charge software instruction costs.
+
+\section{Peripheral, clock, and asynchronous commands}
+\begin{mathpar}
+\inferrule*[left=E-Transition]
+{ S(x) = st' \\ st' \leq st \\ q = \m{cost}(st',st)(K) + \m{bg}(S\setminus x)(K) }
+{
+(M,P,(tid:p,\text{transition}(x,st))::C,S,K) \rightsquigarrow_q
+(M,P,(tid:p,\text{skip})::C,S[x\mapsto st],K)
+}
+
+\inferrule*[left=E-Downgrade]
+{ S(x) = st' \\ (st'\hookrightarrow st)\in x(D) \\ q = \m{cost}(st',st)(K) + \m{bg}(S\setminus x)(K) }
+{
+(M,P,(tid:p,\text{downgrade}(x,st))::C,S,K) \rightsquigarrow_q
+(M,P,(tid:p,\text{skip})::C,S[x\mapsto st],K)
+}
+
+\inferrule*[left=E-Clock]
+{ K' = f \\ q = \m{cost}_{\text{clock}}(K,K') + \m{bg}(S)(K) }
+{
+(M,P,(tid:p,\text{clock }f)::C,S,K) \rightsquigarrow_q
+(M,P,(tid:p,\text{skip})::C,S,K')
+}
+
+\inferrule*[left=E-Match-i]
+{ S(p) = st_i \\ q = \m{bg}(S)(K) }
+{
+(M,P,(tid:r,\text{match }p\text{ with }st_1\rightarrow c_1|\dots|st_n\rightarrow c_n)::C,S,K)
+\rightsquigarrow_q (M,P,(tid:r,c_i)::C,S,K)
+}
+
+\inferrule*[left=E-Async]
+{
+tid \notin \m{dom}(P)\cup\m{threads}(C) \\
+\m{unstable}(S(p)) \\
+q = C_{\text{spawn}}(p,S(p),K) + \m{bg}(S\setminus p)(K)
+}
+{
+(M,P,(tid':r,\text{let }tid=\text{async}(p)\{c_a\})::C,S,K)
+\rightsquigarrow_q
+(M,P[tid\mapsto(p,c_a)],(tid':r,\text{skip})::C,S,K)
+}
+
+\inferrule*[left=E-AsyncPreempt]
+{ P(tid) = (p,c_a) \\ tid \notin \m{threads}(C) \\ q = 0 }
+{
+(M,P,C,S,K) \rightsquigarrow_q (M,P,(tid:p,c_a)::C,S,K)
+}
+
+\inferrule*[left=E-AsyncDone]
+{
+C = (tid:p,\text{skip})::C' \\ tid \neq \text{main} \\
+\m{root}(tid,C') \\ \m{stable}(S(p)) \\ q = 0
+}
+{
+(M,P,C,S,K) \rightsquigarrow_q
+(M,P[tid\mapsto\text{done}(p,\text{skip})],C',S,K)
+}
+
+\inferrule*[left=E-AwaitStart]
+{ q = 0 }
+{
+(M,P,(tid':p,\text{await }tid\text{ timeout}[n]\{c_{\text{fb}}\})::C,S,K)
+\rightsquigarrow_q
+(M,P,(tid':p,\text{await}^{\bullet}\ tid\text{ timeout}[n]\{c_{\text{fb}}\})::C,S,K)
+}
+
+\inferrule*[left=E-Await]
+{ P(tid) = \text{done}(p,\text{skip}) \\ q = 0 }
+{
+(M,P,(tid':r,\text{await}^{\bullet}\ tid\text{ timeout}[n]\{c_{\text{fb}}\})::C,S,K)
+\rightsquigarrow_q
+(M,P\setminus tid,(tid':r,\text{skip})::C,S,K)
+}
+
+\inferrule*[left=E-AwaitWait]
+{ P(tid) = (p,c_a) \\ n>0 \\ q = \m{bg}(S)(K) }
+{
+(M,P,(tid':r,\text{await}^{\bullet}\ tid\text{ timeout}[n]\{c_{\text{fb}}\})::C,S,K)
+\rightsquigarrow_q
+(M,P,(tid':r,\text{await}^{\bullet}\ tid\text{ timeout}[n]\{c_{\text{fb}}\})::C,S,K)
+}
+
+\inferrule*[left=E-Await-Timeout]
+{ P(tid) = (p,c_a) \\ tid\notin\m{threads}(C) \\ q = 0 \\ n\leq0 }
+{
+(M,P,(tid':r,\text{await}^{\bullet}\ tid\text{ timeout}[n]\{c_{\text{fb}}\})::C,S,K)
+\rightsquigarrow_q
+(M,P\setminus tid,(tid':r,c_{\text{fb}})::C,S,K)
+}
+
+\inferrule*[left=E-Timeout-Running]
+{
+P(tid) = (p,c_a) \\ n\leq0 \\
+C = C_a\mathbin{+\!+}((tid':r,\text{await}^{\bullet}\ tid\text{ timeout}[n]\{c_{\text{fb}}\})::C_0) \\
+\m{allFramesOf}(C_a,tid) \\ q = 0
+}
+{
+(M,P,C,S,K) \rightsquigarrow_q
+(M,P\setminus tid,(tid':r,c_{\text{fb}})::C_0,S,K)
+}
+
+\inferrule*[left=E-HWStep]
+{ P(tid) = (p,\_) \\ st' \in \m{HWReach}(S(p)) \\ q = 0 }
+{
+(M,P,C,S,K) \rightsquigarrow_q (M,P,C,S[p\mapsto st'],K)
+}
+\end{mathpar}
+
+\section{Global step and timer draining}
+Let $r$ be the name of the local rule used in a derivation. Define
+$\m{tick}(r)=1$ for
+\textsc{E-Assign}, \textsc{E-IfTrue}, \textsc{E-IfFalse},
+\textsc{E-Transition}, \textsc{E-Downgrade}, \textsc{E-Clock},
+\textsc{E-Match-i}, \textsc{E-Async}, and \textsc{E-AwaitWait};
+otherwise $\m{tick}(r)=0$. This is a classification of rules, not an extra
+machine component or an inference from whether $q$ is zero.
+
+\begin{mathpar}
+\inferrule*[left=E-Step]
+{
+(M,P,C,S,K) \rightsquigarrow_q (M',P',C',S',K')\text{ by }r \\
+C'' = \m{drain}_{\m{tick}(r)K}(C')
+}
+{
+(M,P,C,S,K,T) \xrightarrow{q}
+(M',P',C'',S',K',T+\m{tick}(r)K)
+}
+\end{mathpar}
+
+Define $\m{drain}$ on frames and stacks:
+\[
+\begin{aligned}
+D_d(tid:p,\text{await}^{\bullet}\ h\text{ timeout}[n]\{c\})
+ &= (tid:p,\text{await}^{\bullet}\ h\text{ timeout}[\max(0,n-d)]\{c\}),\\
+D_d(F)&=F\quad\text{for every other frame},\\
+\m{drain}_d(\cdot)&=\cdot,\\
+\m{drain}_d(F::C)&=D_d(F)::\m{drain}_d(C).
+\end{aligned}
+\]
+Only active timers are decremented, including those below a running job.
+Unexecuted awaits inside commands and continuations are unchanged.
+Start a current await before dispatching async work. Process completion
+bookkeeping and expired active timers before another computational step.
+If completion has already been recorded, use \textsc{E-Await}.
+
+\section{Declarations}
+\begin{mathpar}
+\inferrule*[left=E-PeriphDecl]
+{ S' = S[id\mapsto s_{\text{curr}}] }
+{
+(M,S,id\{\langle s_0,\dots,s_n\rangle,s_{\text{curr}},<,D\})
+\rightarrow (M,S')
+}
+
+\inferrule*[left=E-FunDecl]
+{ M' = M[f\mapsto\{c;\text{ret}:=e\}] }
+{
+(M,S,\text{fn }f(x,p):(\tau_1,\vec s_1)\rightarrow(\tau_2,\vec s_2)\{c;\text{ret}:=e\})
+\rightarrow(M',S)
+}
+\end{mathpar}
+Peripheral metadata and formal parameter bindings remain available to the
+rules; $S$ itself maps peripherals to their current states. Declarations are
+elaborated before execution and are not charged to the program.
+
+\section{Conventions needed by the rules}
+\begin{itemize}
+\item $\m{threads}(C)$ lists thread identifiers in the stack.
+$\m{root}(tid,C')$ holds when $C'$ is empty or its top frame belongs to another
+thread, preventing premature completion at an intermediate skip.
+Handles are hygienically bound names. Local variable names are freshened;
+async code cannot modify parent-local variables. Capture excludes access by
+other software threads until completion is awaited or timeout hands off.
+\item Transition costs include the changing peripheral's own resource use,
+which explains $S\setminus x$. Likewise $C_{\text{spawn}}$ includes the
+captured peripheral's own cost during spawning. If it does not, add that
+peripheral's background cost to the spawn charge and its typing rule.
+\item Hardware evolution is represented by instantaneous state changes with
+resource use included in state/background costs, so \textsc{E-HWStep} does not
+charge a second impulse cost. Exclude infinite zero-time hardware runs.
+If separately charged hardware-transition costs are retained instead, their
+sum needs a corresponding typing allowance.
+\item Timeout retains the actual state $S$ and assumes an abstract exclusive
+handoff to the fallback; its implementation is outside scope. The running
+rule shown assumes that the only job frames above the waiting parent belong
+to the awaited job (for example, one outstanding async job). Unrestricted
+multi-job scheduling needs a more general handler rule. Check the fallback
+from every possible state at expiry, not just the spawn state.
+\end{itemize}
+
+\paragraph{Timeout cost correspondence.}
+Your expression
+\[
+B=C_{\text{unstable}}(p)+\m{cost}(\Delta\setminus p)+\m{cost}(\cdot)
+\]
+already covers partial activity if, interpreted as a rate, it satisfies
+$q_{\text{step}}\leq KB$ for every computational step during active await.
+There is no separate partial-work term. Explicit transition costs must also
+be covered by this property when such commands are allowed.
+For boundary-checked expiry with $K\leq K_{\max}$, the conservative bound is
+$(n+K_{\max})B+Q_{\text{fb}}$; $nB+Q_{\text{fb}}$ requires exact deadline
+handling or a normalization removing overshoot. Work before await activation
+is accounted for outside that interval. Resource consumption of a run is
+$Q_{\text{run}}=\sum_i q_i$; the global rule preserves these labels without
+adding a resource counter to the machine.
+\end{document}

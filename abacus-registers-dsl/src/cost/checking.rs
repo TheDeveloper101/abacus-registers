@@ -18,6 +18,7 @@ enum Value {
     Scalar,
     Register(usize),
     Cell(usize),
+    Task(usize),
     Tuple(Vec<Value>),
     Object(String, BTreeMap<String, Value>),
 }
@@ -33,6 +34,17 @@ struct Context {
     devices: Vec<Device>,
     inferred_inputs: VecDeque<(usize, States)>,
     bindings: BTreeMap<String, Value>,
+    captured: BTreeSet<usize>,
+    tasks: BTreeMap<usize, AsyncTask>,
+    next_task: usize,
+}
+
+#[derive(Clone)]
+struct AsyncTask {
+    device: usize,
+    transient_states: States,
+    normal_states: States,
+    normal_summary: ControlFlowSummary,
 }
 
 #[allow(dead_code)]
@@ -42,6 +54,7 @@ pub enum ControlFlowSummary {
     Command(CommandSummary),
     Sequence(Vec<ControlFlowSummary>),
     Branch(Vec<ControlFlowSummary>),
+    Scale(usize, Box<ControlFlowSummary>),
 }
 
 #[allow(dead_code)]
@@ -89,6 +102,7 @@ impl ControlFlowSummary {
             }
             Self::Sequence(parts) => parts.iter().map(Self::cost).sum(),
             Self::Branch(arms) => arms.iter().map(Self::cost).max().unwrap_or(0),
+            Self::Scale(factor, summary) => factor * summary.cost(),
         }
     }
 }
@@ -101,6 +115,7 @@ enum CostExpression {
     Transition(String, String),
     Sum(Vec<CostExpression>),
     Maximum(Vec<CostExpression>),
+    Scaled(usize, Box<CostExpression>),
 }
 
 impl CostExpression {
@@ -155,6 +170,7 @@ impl std::fmt::Display for CostExpression {
                 }
                 write!(formatter, ")")
             }
+            Self::Scaled(factor, expression) => write!(formatter, "{factor} * ({expression})"),
             Self::Sum(terms) => {
                 let mut index = 0;
                 let mut first = true;
@@ -204,6 +220,13 @@ fn event_cost(
     models: &[Peripheral],
 ) -> CostExpression {
     let model = &models[devices[event.device].model];
+    if event.operation == "sync_state" {
+        return CostExpression::maximum(event.source.iter().flat_map(|source| {
+            event.target.iter().map(move |target| {
+                CostExpression::Transition(state_label(model, source), state_label(model, target))
+            })
+        }));
+    }
     if event.transition && model.states.values().any(|state| state.cost.is_symbolic()) {
         return CostExpression::maximum(event.source.iter().map(|source| {
             let target = &model.operations[&(source.clone(), event.operation.clone())].target;
@@ -244,6 +267,9 @@ fn symbolic_cost(
         ),
         ControlFlowSummary::Branch(arms) => {
             CostExpression::maximum(arms.iter().map(|arm| symbolic_cost(arm, devices, models)))
+        }
+        ControlFlowSummary::Scale(factor, summary) => {
+            CostExpression::Scaled(*factor, Box::new(symbolic_cost(summary, devices, models)))
         }
     }
 }
@@ -438,6 +464,20 @@ impl Checker<'_> {
             }
             let initial_devices = context.devices.clone();
             let evaluation = self.block(&function.body, &mut context)?;
+            if !context.tasks.is_empty() {
+                return Err(Error::new(
+                    function.body.span(),
+                    "every heliod_async task must be consumed by heliod_await",
+                ));
+            }
+            for device in &context.devices {
+                require_phase(
+                    &self.models[device.model],
+                    &device.states,
+                    false,
+                    function.body.span(),
+                )?;
+            }
             if evaluation.summary.cost() != evaluation.cost {
                 return Err(Error::new(
                     function.body.span(),
@@ -597,12 +637,6 @@ impl Checker<'_> {
             } else {
                 continue;
             };
-            if states.iter().any(|s| model.states[s].transient) {
-                return Err(Error::new(
-                    ty.span(),
-                    "transient states require hardware-concurrency analysis",
-                ));
-            }
             let states = if let Some(inferred) = context.inferred_inputs.pop_front() {
                 if inferred.0 != index {
                     return Err(Error::new(ty.span(), "inferred peripheral type mismatch"));
@@ -613,6 +647,7 @@ impl Checker<'_> {
             } else {
                 states
             };
+            require_uniform_phase(model, &states, ty.span())?;
             let id = context.devices.len();
             context.devices.push(Device {
                 model: index,
@@ -633,7 +668,7 @@ impl Checker<'_> {
     ) -> Vec<BackgroundCharge> {
         let mut charges = Vec::new();
         for (id, device) in context.devices.iter().enumerate() {
-            if transitioning.contains(&id) {
+            if transitioning.contains(&id) || context.captured.contains(&id) {
                 continue;
             }
             let states = &self.models[device.model].states;
@@ -662,6 +697,11 @@ impl Checker<'_> {
         match expr {
             Expr::MethodCall(call) => {
                 let name = call.method.to_string();
+                if name == "sync_state" {
+                    if let Ok(Value::Register(id)) = lookup(&call.receiver, context) {
+                        transitioning.insert(id);
+                    }
+                }
                 if let Ok(Value::Register(id)) = lookup(&call.receiver, context) {
                     let device = &context.devices[id];
                     let model = &self.models[device.model];
@@ -939,6 +979,12 @@ impl Checker<'_> {
                     .ok_or_else(|| Error::new_spanned(&path.path, "expected a nonempty path"))?
                     .ident
                     .to_string();
+                if name == "heliod_async" {
+                    return self.async_spawn(call, context);
+                }
+                if name == "heliod_await" {
+                    return self.await_timeout(call, context);
+                }
                 let mut values = Vec::new();
                 let mut cost = 0;
                 let mut summaries = Vec::new();
@@ -976,6 +1022,190 @@ impl Checker<'_> {
             )),
         }
     }
+
+    fn async_spawn(&mut self, call: &syn::ExprCall, context: &mut Context) -> Result<Evaluation> {
+        if call.args.len() != 2 {
+            return Err(Error::new(
+                call.span(),
+                "heliod_async expects a peripheral and a one-argument closure",
+            ));
+        }
+        let device = match lookup(&call.args[0], context)? {
+            Value::Register(device) => device,
+            _ => return Err(Error::new(call.args[0].span(), "expected a peripheral")),
+        };
+        if context.captured.contains(&device) {
+            return Err(Error::new(call.span(), "peripheral is already captured"));
+        }
+        let Expr::Closure(closure) = &call.args[1] else {
+            return Err(Error::new(
+                call.args[1].span(),
+                "heliod_async needs an inline closure",
+            ));
+        };
+        if closure.inputs.len() != 1 {
+            return Err(Error::new(
+                closure.span(),
+                "heliod_async closure needs one peripheral parameter",
+            ));
+        }
+        let model = &self.models[context.devices[device].model];
+        require_phase(
+            model,
+            &context.devices[device].states,
+            true,
+            call.args[0].span(),
+        )?;
+        let transient_states = context.devices[device].states.clone();
+
+        let mut asynchronous = context.clone();
+        asynchronous.captured = (0..asynchronous.devices.len())
+            .filter(|other| *other != device)
+            .collect();
+        bind(
+            &closure.inputs[0],
+            Value::Register(device),
+            &mut asynchronous,
+        )?;
+        let normal = self.body(&closure.body, &mut asynchronous)?;
+        if normal.returned {
+            return Err(Error::new(
+                closure.span(),
+                "return is not supported inside a heliod_async closure",
+            ));
+        }
+        require_phase(
+            model,
+            &asynchronous.devices[device].states,
+            false,
+            closure.span(),
+        )?;
+
+        let task = context.next_task;
+        context.next_task += 1;
+        context.captured.insert(device);
+        context.tasks.insert(
+            task,
+            AsyncTask {
+                device,
+                transient_states,
+                normal_states: asynchronous.devices[device].states.clone(),
+                normal_summary: normal.summary,
+            },
+        );
+        let mut result = Evaluation::new(Value::Task(task), 0);
+        result.call_body_charged = true;
+        Ok(result)
+    }
+
+    fn await_timeout(&mut self, call: &syn::ExprCall, context: &mut Context) -> Result<Evaluation> {
+        if call.args.len() != 3 {
+            return Err(Error::new(
+                call.span(),
+                "heliod_await expects a task, timeout, and one-argument fallback closure",
+            ));
+        }
+        let task_id = match lookup(&call.args[0], context)? {
+            Value::Task(task) => task,
+            _ => return Err(Error::new(call.args[0].span(), "expected a Heliod task")),
+        };
+        let task = context
+            .tasks
+            .get(&task_id)
+            .cloned()
+            .ok_or_else(|| Error::new(call.args[0].span(), "task was already awaited"))?;
+        let timeout = integer_literal(&call.args[1])?;
+        let Expr::Closure(closure) = &call.args[2] else {
+            return Err(Error::new(
+                call.args[2].span(),
+                "heliod_await needs an inline fallback closure",
+            ));
+        };
+        if closure.inputs.len() != 1 {
+            return Err(Error::new(
+                closure.span(),
+                "heliod_await fallback needs one peripheral parameter",
+            ));
+        }
+
+        let mut fallback_context = context.clone();
+        fallback_context.captured.remove(&task.device);
+        fallback_context.devices[task.device].states = task.transient_states.clone();
+        bind(
+            &closure.inputs[0],
+            Value::Register(task.device),
+            &mut fallback_context,
+        )?;
+        let fallback = self.body(&closure.body, &mut fallback_context)?;
+        if fallback.returned {
+            return Err(Error::new(
+                closure.span(),
+                "return is not supported inside a timeout fallback",
+            ));
+        }
+        let model = &self.models[context.devices[task.device].model];
+        require_phase(
+            model,
+            &fallback_context.devices[task.device].states,
+            false,
+            closure.span(),
+        )?;
+
+        let mut timeout_background = Vec::new();
+        for (device, current) in context.devices.iter().enumerate() {
+            let states = if device == task.device {
+                task.transient_states.clone()
+            } else if context.captured.contains(&device) {
+                context
+                    .tasks
+                    .values()
+                    .find(|pending| pending.device == device)
+                    .map(|pending| pending.transient_states.clone())
+                    .unwrap_or_else(|| current.states.clone())
+            } else {
+                current.states.clone()
+            };
+            let state_model = &self.models[current.model];
+            let cost = states
+                .iter()
+                .filter_map(|state| state_model.states[state].cost.concrete())
+                .max()
+                .unwrap_or(0);
+            timeout_background.push(BackgroundCharge {
+                device,
+                states,
+                cost,
+                input_states: if device == task.device || context.captured.contains(&device) {
+                    States::new()
+                } else {
+                    current.input_states.clone()
+                },
+            });
+        }
+        let timeout_tick = ControlFlowSummary::Command(CommandSummary {
+            foreground: 0,
+            background: timeout_background,
+            events: Vec::new(),
+            span: call.args[1].span(),
+        });
+        let timeout_summary = sequence([
+            ControlFlowSummary::Scale(timeout, Box::new(timeout_tick)),
+            fallback.summary,
+        ]);
+        let summary = ControlFlowSummary::Branch(vec![task.normal_summary, timeout_summary]);
+
+        let mut states = task.normal_states;
+        states.extend(fallback_context.devices[task.device].states.iter().cloned());
+        context.devices[task.device].states = states;
+        context.captured.remove(&task.device);
+        context.tasks.remove(&task_id);
+
+        let mut result = Evaluation::new(Value::Scalar, summary.cost());
+        result.summary = summary;
+        result.call_body_charged = true;
+        Ok(result)
+    }
+
     fn method(&mut self, call: &syn::ExprMethodCall, context: &mut Context) -> Result<Evaluation> {
         if call.turbofish.is_some() {
             return Err(Error::new(
@@ -997,6 +1227,11 @@ impl Checker<'_> {
         if name == "map" {
             if let Ok(Value::Cell(id)) = lookup(&call.receiver, context) {
                 return self.cell_map(id, call, context);
+            }
+        }
+        if name == "sync_state" && call.args.is_empty() {
+            if let Ok(Value::Register(device)) = lookup(&call.receiver, context) {
+                return self.sync_state(device, call, context);
             }
         }
         let (receiver, operation) = match call.receiver.as_ref() {
@@ -1030,11 +1265,14 @@ impl Checker<'_> {
                 cost = cost.max(op.cost.concrete().unwrap_or(0));
                 transition = op.transition;
             }
-            if targets.iter().any(|s| model.states[s].transient) {
+            if context.captured.contains(&id) {
                 return Err(Error::new(
                     call.span(),
-                    "transient states require hardware-concurrency analysis",
+                    "captured peripheral is unavailable until heliod_await",
                 ));
+            }
+            if transition && targets.iter().any(|s| model.states[s].transient) {
+                targets = hardware_reachable(model, &targets);
             }
             if !transition && !model.is_symbolic() {
                 let current_states = device
@@ -1114,6 +1352,60 @@ impl Checker<'_> {
             call.span(),
             "unknown method; bind intermediate registers or include the helper in the checked API",
         ))
+    }
+
+    fn sync_state(
+        &self,
+        device: usize,
+        call: &syn::ExprMethodCall,
+        context: &mut Context,
+    ) -> Result<Evaluation> {
+        if context.captured.contains(&device) {
+            return Err(Error::new(
+                call.span(),
+                "captured peripheral is unavailable until heliod_await",
+            ));
+        }
+        let model = &self.models[context.devices[device].model];
+        require_phase(model, &context.devices[device].states, true, call.span())?;
+        let source = context.devices[device].states.clone();
+        let mut target = States::new();
+        let mut cost = 0;
+        for state in &source {
+            let operations = model
+                .operations
+                .iter()
+                .filter(|((candidate, _), operation)| {
+                    candidate == state
+                        && operation.transition
+                        && !model.states[&operation.target].transient
+                })
+                .collect::<Vec<_>>();
+            if operations.is_empty() {
+                return Err(Error::new(
+                    call.span(),
+                    format!("transient state `{state}` has no declared stable synchronization transition"),
+                ));
+            }
+            for (_, operation) in operations {
+                target.insert(operation.target.clone());
+                cost = cost.max(operation.cost.concrete().unwrap_or(0));
+            }
+        }
+        context.devices[device].states = target.clone();
+        context.devices[device].input_states.clear();
+        let mut result = Evaluation::new(Value::Register(device), cost);
+        result.events.push(PeripheralEvent {
+            device,
+            operation: "sync_state".into(),
+            source,
+            target,
+            transition: true,
+            cost,
+            source_inputs: States::new(),
+            span: call.span(),
+        });
+        Ok(result)
     }
     fn cell_map(
         &mut self,
@@ -1452,6 +1744,10 @@ impl Checker<'_> {
                     .map(|arm| self.instantiate_control_flow(arm, devices, context, mapped))
                     .collect::<Result<_>>()?,
             ),
+            ControlFlowSummary::Scale(factor, summary) => ControlFlowSummary::Scale(
+                *factor,
+                Box::new(self.instantiate_control_flow(summary, devices, context, mapped)?),
+            ),
         })
     }
 }
@@ -1464,6 +1760,10 @@ fn map_argument(
 ) -> Result<()> {
     match (formal, actual) {
         (Value::Scalar, Value::Scalar) => Ok(()),
+        (Value::Task(_), _) | (_, Value::Task(_)) => Err(Error::new(
+            span,
+            "Heliod tasks cannot cross function boundaries",
+        )),
         (Value::Register(formal), Value::Register(actual))
         | (Value::Cell(formal), Value::Cell(actual)) => {
             let mapped = devices
@@ -1512,6 +1812,12 @@ fn map_result(value: &Value, devices: &[usize], span: proc_macro2::Span) -> Resu
                 .get(*device)
                 .ok_or_else(|| Error::new(span, "invalid summarized return cell"))?,
         ),
+        Value::Task(_) => {
+            return Err(Error::new(
+                span,
+                "Heliod tasks cannot cross function boundaries",
+            ))
+        }
         Value::Tuple(values) => Value::Tuple(
             values
                 .iter()
@@ -1526,6 +1832,75 @@ fn map_result(value: &Value, devices: &[usize], span: proc_macro2::Span) -> Resu
                 .collect::<Result<_>>()?,
         ),
     })
+}
+
+fn require_uniform_phase(
+    model: &Peripheral,
+    states: &States,
+    span: proc_macro2::Span,
+) -> Result<()> {
+    if let Some(first) = states.iter().next() {
+        require_phase(model, states, model.states[first].transient, span)?;
+    }
+    Ok(())
+}
+
+fn require_phase(
+    model: &Peripheral,
+    states: &States,
+    transient: bool,
+    span: proc_macro2::Span,
+) -> Result<()> {
+    if states.is_empty()
+        || states
+            .iter()
+            .any(|state| model.states[state].transient != transient)
+    {
+        let expected = if transient { "transient" } else { "stable" };
+        return Err(Error::new(
+            span,
+            format!("peripheral must be in only {expected} states"),
+        ));
+    }
+    Ok(())
+}
+
+fn hardware_reachable(model: &Peripheral, initial: &States) -> States {
+    let mut reachable = initial.clone();
+    let mut work = initial.iter().cloned().collect::<Vec<_>>();
+    while let Some(source) = work.pop() {
+        for operation in model
+            .operations
+            .iter()
+            .filter(|((state, _), operation)| {
+                state == &source
+                    && operation.transition
+                    && model.states[&operation.target].transient
+            })
+            .map(|(_, operation)| operation)
+        {
+            if reachable.insert(operation.target.clone()) {
+                work.push(operation.target.clone());
+            }
+        }
+    }
+    reachable
+}
+
+fn integer_literal(expression: &Expr) -> Result<usize> {
+    let Expr::Lit(literal) = expression else {
+        return Err(Error::new(
+            expression.span(),
+            "timeout must be a nonnegative integer literal",
+        ));
+    };
+    let syn::Lit::Int(integer) = &literal.lit else {
+        return Err(Error::new(
+            expression.span(),
+            "timeout must be a nonnegative integer literal",
+        ));
+    };
+    integer.base10_parse()
 }
 fn lookup(expr: &Expr, context: &Context) -> Result<Value> {
     match expr {
@@ -1579,6 +1954,11 @@ fn join_context(left: &Context, right: &Context) -> Result<Context> {
     if left.devices.len() != right.devices.len() {
         return Err(failure("branches change peripheral identities"));
     }
+    if left.captured != right.captured
+        || left.tasks.keys().collect::<Vec<_>>() != right.tasks.keys().collect::<Vec<_>>()
+    {
+        return Err(failure("branches must leave the same async tasks pending"));
+    }
     let mut joined = left.clone();
     for (device, other) in joined.devices.iter_mut().zip(&right.devices) {
         device.states.extend(other.states.iter().cloned());
@@ -1589,6 +1969,21 @@ fn join_context(left: &Context, right: &Context) -> Result<Context> {
     joined
         .bindings
         .retain(|name, value| right.bindings.get(name) == Some(value));
+    for (id, task) in &mut joined.tasks {
+        let other = &right.tasks[id];
+        if task.device != other.device {
+            return Err(failure("branches change captured peripheral identities"));
+        }
+        task.transient_states
+            .extend(other.transient_states.iter().cloned());
+        task.normal_states
+            .extend(other.normal_states.iter().cloned());
+        task.normal_summary = ControlFlowSummary::Branch(vec![
+            task.normal_summary.clone(),
+            other.normal_summary.clone(),
+        ]);
+    }
+    joined.next_task = left.next_task.max(right.next_task);
     Ok(joined)
 }
 fn join_result(left: Evaluation, right: Evaluation) -> Result<Evaluation> {

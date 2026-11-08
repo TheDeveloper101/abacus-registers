@@ -19,6 +19,7 @@ type States = BTreeSet<String>;
 enum Value {
     Scalar,
     Register(usize),
+    Task(usize),
     Tuple(Vec<Value>),
     Object(String, BTreeMap<String, Value>),
 }
@@ -42,6 +43,16 @@ struct Context {
     devices: Vec<Device>,
     inputs: Vec<States>,
     bindings: BTreeMap<String, Value>,
+    captured: BTreeSet<usize>,
+    tasks: BTreeMap<usize, InferenceTask>,
+    next_task: usize,
+}
+
+#[derive(Clone)]
+struct InferenceTask {
+    device: usize,
+    transient: States,
+    normal: States,
 }
 
 #[derive(Clone)]
@@ -198,6 +209,21 @@ impl Checker<'_> {
                 parameters.push(value);
             }
             let value = self.block(&function.body, &mut context)?;
+            if !context.tasks.is_empty() {
+                return Err(Error::new(
+                    function.body.span(),
+                    "every heliod_async task must be consumed by heliod_await",
+                ));
+            }
+            for device in &context.devices {
+                let states = possible(&device.state, &context.inputs);
+                require_phase(
+                    &self.models[device.model],
+                    &states,
+                    false,
+                    function.body.span(),
+                )?;
+            }
             let inputs = context
                 .devices
                 .iter()
@@ -359,6 +385,12 @@ impl Checker<'_> {
                     .ok_or_else(|| Error::new(path.span(), "expected function name"))?
                     .ident
                     .to_string();
+                if name == "heliod_async" {
+                    return self.async_spawn(call, context);
+                }
+                if name == "heliod_await" {
+                    return self.await_timeout(call, context);
+                }
                 let values = call
                     .args
                     .iter()
@@ -383,10 +415,143 @@ impl Checker<'_> {
         }
     }
 
+    fn async_spawn(&mut self, call: &syn::ExprCall, context: &mut Context) -> Result<Value> {
+        if call.args.len() != 2 {
+            return Err(Error::new(
+                call.span(),
+                "heliod_async expects a peripheral and a one-argument closure",
+            ));
+        }
+        let Value::Register(device) = lookup(&call.args[0], context)? else {
+            return Err(Error::new(call.args[0].span(), "expected a peripheral"));
+        };
+        if context.captured.contains(&device) {
+            return Err(Error::new(call.span(), "peripheral is already captured"));
+        }
+        let Expr::Closure(closure) = &call.args[1] else {
+            return Err(Error::new(
+                call.args[1].span(),
+                "heliod_async needs an inline closure",
+            ));
+        };
+        if closure.inputs.len() != 1 {
+            return Err(Error::new(
+                closure.span(),
+                "heliod_async closure needs one peripheral parameter",
+            ));
+        }
+        let model = &self.models[context.devices[device].model];
+        let transient = model
+            .states
+            .iter()
+            .filter(|(_, state)| state.transient)
+            .map(|(name, _)| name.clone())
+            .collect();
+        restrict(
+            &context.devices[device].state,
+            &transient,
+            &mut context.inputs,
+            call.args[0].span(),
+        )?;
+        let transient = possible(&context.devices[device].state, &context.inputs);
+
+        let mut asynchronous = context.clone();
+        asynchronous.captured = (0..asynchronous.devices.len())
+            .filter(|other| *other != device)
+            .collect();
+        bind(
+            &closure.inputs[0],
+            Value::Register(device),
+            &mut asynchronous,
+        )?;
+        self.expression(&closure.body, &mut asynchronous)?;
+        let normal = possible(&asynchronous.devices[device].state, &asynchronous.inputs);
+        require_phase(model, &normal, false, closure.span())?;
+
+        let task = context.next_task;
+        context.next_task += 1;
+        context.captured.insert(device);
+        context.tasks.insert(
+            task,
+            InferenceTask {
+                device,
+                transient,
+                normal,
+            },
+        );
+        Ok(Value::Task(task))
+    }
+
+    fn await_timeout(&mut self, call: &syn::ExprCall, context: &mut Context) -> Result<Value> {
+        if call.args.len() != 3 {
+            return Err(Error::new(
+                call.span(),
+                "heliod_await expects a task, timeout, and one-argument fallback closure",
+            ));
+        }
+        let Value::Task(task_id) = lookup(&call.args[0], context)? else {
+            return Err(Error::new(call.args[0].span(), "expected a Heliod task"));
+        };
+        integer_literal(&call.args[1])?;
+        let task = context
+            .tasks
+            .get(&task_id)
+            .cloned()
+            .ok_or_else(|| Error::new(call.args[0].span(), "task was already awaited"))?;
+        let Expr::Closure(closure) = &call.args[2] else {
+            return Err(Error::new(
+                call.args[2].span(),
+                "heliod_await needs an inline fallback closure",
+            ));
+        };
+        if closure.inputs.len() != 1 {
+            return Err(Error::new(
+                closure.span(),
+                "heliod_await fallback needs one peripheral parameter",
+            ));
+        }
+        let mut fallback = context.clone();
+        fallback.captured.remove(&task.device);
+        fallback.devices[task.device].state = StateExpression::Known(task.transient);
+        bind(
+            &closure.inputs[0],
+            Value::Register(task.device),
+            &mut fallback,
+        )?;
+        self.expression(&closure.body, &mut fallback)?;
+        let fallback_states = possible(&fallback.devices[task.device].state, &fallback.inputs);
+        let model = &self.models[context.devices[task.device].model];
+        require_phase(model, &fallback_states, false, closure.span())?;
+
+        context.devices[task.device].state = StateExpression::Union(vec![
+            StateExpression::Known(task.normal),
+            StateExpression::Known(fallback_states),
+        ]);
+        context.captured.remove(&task.device);
+        context.tasks.remove(&task_id);
+        Ok(Value::Scalar)
+    }
+
     fn method(&mut self, call: &syn::ExprMethodCall, context: &mut Context) -> Result<Value> {
         let name = call.method.to_string();
         if name == "into" && call.args.is_empty() {
             return self.expression(&call.receiver, context);
+        }
+        if name == "sync_state" && call.args.is_empty() {
+            if let Ok(Value::Register(device)) = lookup(&call.receiver, context) {
+                if context.captured.contains(&device) {
+                    return Err(Error::new(
+                        call.span(),
+                        "captured peripheral is unavailable until heliod_await",
+                    ));
+                }
+                let model = &self.models[context.devices[device].model];
+                let states = possible(&context.devices[device].state, &context.inputs);
+                require_phase(model, &states, true, call.span())?;
+                let stable = synchronization_targets(model, &states, call.span())?;
+                context.devices[device].state = StateExpression::Known(stable);
+                return Ok(Value::Register(device));
+            }
         }
         let (receiver, operation) = match call.receiver.as_ref() {
             Expr::Field(field)
@@ -400,6 +565,12 @@ impl Checker<'_> {
             _ => (call.receiver.as_ref(), name.clone()),
         };
         if let Ok(Value::Register(id)) = lookup(receiver, context) {
+            if context.captured.contains(&id) {
+                return Err(Error::new(
+                    call.span(),
+                    "captured peripheral is unavailable until heliod_await",
+                ));
+            }
             for argument in &call.args {
                 self.expression(argument, context)?;
             }
@@ -428,6 +599,9 @@ impl Checker<'_> {
                 transition |= operation.transition;
             }
             if transition {
+                if targets.iter().any(|state| model.states[state].transient) {
+                    targets = hardware_reachable(model, &targets);
+                }
                 context.devices[id].state = StateExpression::Known(targets);
                 Ok(Value::Register(id))
             } else {
@@ -538,6 +712,11 @@ fn join(left: Context, right: Context) -> Result<Context> {
     if left.devices.len() != right.devices.len() {
         return Err(failure("branches change peripheral identities"));
     }
+    if left.captured != right.captured
+        || left.tasks.keys().collect::<Vec<_>>() != right.tasks.keys().collect::<Vec<_>>()
+    {
+        return Err(failure("branches must leave the same async tasks pending"));
+    }
     let mut joined = left.clone();
     for ((device, other), (input, other_input)) in joined
         .devices
@@ -557,11 +736,23 @@ fn join(left: Context, right: Context) -> Result<Context> {
     joined
         .bindings
         .retain(|name, value| right.bindings.get(name) == Some(value));
+    for (id, task) in &mut joined.tasks {
+        let other = &right.tasks[id];
+        if task.device != other.device {
+            return Err(failure("branches change captured peripheral identities"));
+        }
+        task.transient.extend(other.transient.iter().cloned());
+        task.normal.extend(other.normal.iter().cloned());
+    }
+    joined.next_task = left.next_task.max(right.next_task);
     Ok(joined)
 }
 
 fn lookup(expression: &Expr, context: &Context) -> Result<Value> {
     match expression {
+        // Associated constants such as `Task::ENABLE::SET` are scalar values,
+        // not local bindings whose peripheral identity must be resolved.
+        Expr::Path(path) if path.path.segments.len() > 1 => Ok(Value::Scalar),
         Expr::Path(path) if path.path.segments.len() == 1 => context
             .bindings
             .get(&path.path.segments[0].ident.to_string())
@@ -616,6 +807,10 @@ fn map_argument(
 ) -> Result<()> {
     match (formal, actual) {
         (Value::Scalar, Value::Scalar) => Ok(()),
+        (Value::Task(_), _) | (_, Value::Task(_)) => Err(Error::new(
+            span,
+            "Heliod tasks cannot cross function boundaries",
+        )),
         (Value::Register(formal), Value::Register(actual)) => {
             match devices[*formal] {
                 Some(existing) if existing != *actual => {
@@ -651,6 +846,12 @@ fn map_result(value: &Value, devices: &[usize], span: proc_macro2::Span) -> Resu
                 .get(*id)
                 .ok_or_else(|| Error::new(span, "invalid peripheral result"))?,
         ),
+        Value::Task(_) => {
+            return Err(Error::new(
+                span,
+                "Heliod tasks cannot cross function boundaries",
+            ))
+        }
         Value::Tuple(values) => Value::Tuple(
             values
                 .iter()
@@ -665,6 +866,94 @@ fn map_result(value: &Value, devices: &[usize], span: proc_macro2::Span) -> Resu
                 .collect::<Result<_>>()?,
         ),
     })
+}
+
+fn require_phase(
+    model: &Peripheral,
+    states: &States,
+    transient: bool,
+    span: proc_macro2::Span,
+) -> Result<()> {
+    if states.is_empty()
+        || states
+            .iter()
+            .any(|state| model.states[state].transient != transient)
+    {
+        let expected = if transient { "transient" } else { "stable" };
+        return Err(Error::new(
+            span,
+            format!("peripheral must be in only {expected} states"),
+        ));
+    }
+    Ok(())
+}
+
+fn hardware_reachable(model: &Peripheral, initial: &States) -> States {
+    let mut reachable = initial.clone();
+    let mut work = initial.iter().cloned().collect::<Vec<_>>();
+    while let Some(source) = work.pop() {
+        for operation in model
+            .operations
+            .iter()
+            .filter(|((state, _), operation)| {
+                state == &source
+                    && operation.transition
+                    && model.states[&operation.target].transient
+            })
+            .map(|(_, operation)| operation)
+        {
+            if reachable.insert(operation.target.clone()) {
+                work.push(operation.target.clone());
+            }
+        }
+    }
+    reachable
+}
+
+fn synchronization_targets(
+    model: &Peripheral,
+    states: &States,
+    span: proc_macro2::Span,
+) -> Result<States> {
+    let mut targets = States::new();
+    for state in states {
+        let from_state = model
+            .operations
+            .iter()
+            .filter(|((source, _), operation)| {
+                source == state
+                    && operation.transition
+                    && !model.states[&operation.target].transient
+            })
+            .map(|(_, operation)| operation.target.clone())
+            .collect::<States>();
+        if from_state.is_empty() {
+            return Err(Error::new(
+                span,
+                format!(
+                    "transient state `{state}` has no declared stable synchronization transition"
+                ),
+            ));
+        }
+        targets.extend(from_state);
+    }
+    Ok(targets)
+}
+
+fn integer_literal(expression: &Expr) -> Result<usize> {
+    let Expr::Lit(literal) = expression else {
+        return Err(Error::new(
+            expression.span(),
+            "timeout must be a nonnegative integer literal",
+        ));
+    };
+    let syn::Lit::Int(integer) = &literal.lit else {
+        return Err(Error::new(
+            expression.span(),
+            "timeout must be a nonnegative integer literal",
+        ));
+    };
+    integer.base10_parse()
 }
 
 fn resolve(scope: &str, requested: &str, functions: &BTreeMap<String, Function>) -> String {

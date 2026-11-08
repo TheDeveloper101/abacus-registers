@@ -143,8 +143,53 @@ impl Driver {
 
 The explicit `SensorRegisters<Off>` typestate API and `AbacusCell` remain available
 for code that is not checked by Heliod or that needs the existing runtime state
-container. Recursive functions and hardware-concurrent transient-state inference
-are outside the sequential fragment.
+container. Recursive functions remain unsupported.
+
+## Bounded asynchronous operations
+
+Heliod models the paper's capturing `async` and timed `await` rules with two
+analyzer intrinsics. A Tock integration can provide functions with these names
+whose runtime behavior starts an interrupt-driven operation and installs its
+completion and alarm callbacks:
+
+```rust
+let registers = registers.into_start(); // enters a transient state
+let task = heliod_async(registers, |registers| {
+    // normal completion path
+    registers.sync_state()
+});
+heliod_await(task, 10, |registers| {
+    // timeout recovery path: cancel/reset and synchronize
+    registers.sync_state()
+});
+```
+
+`heliod_async` captures exactly one peripheral. Its closure is checked from the
+full hardware-reachable transient state set and must finish in stable states.
+The captured peripheral cannot be used by the caller before `heliod_await`.
+`heliod_await` requires a nonnegative integer-literal timeout, checks its fallback
+from every reachable transient state, and requires the fallback to finish in
+stable states as well. Every task must be awaited before its function exits.
+
+The bound for the await is the maximum of the normal completion path and:
+
+```text
+timeout * (maximum reachable transient background cost
+           + background cost of every other live peripheral)
++ fallback cost
+```
+
+The join restores the peripheral with the union of the normal and timeout stable
+states. `sync_state()` reuses Abacus's transient reconciliation mechanism. For
+cost checking, every possible transient source must have a declared state-machine
+transition to a stable state; Heliod conservatively unions those stable targets
+and takes their maximum transition cost. Transient-to-transient declared state
+changes form `HWReach` because the current Abacus state machine does not have a
+separate hardware-edge declaration.
+
+Other pending async peripherals remain live during the timeout. Heliod charges
+each one using its maximum reachable transient background cost on every timeout
+step; ordinary ambient peripherals use their current possible state sets.
 
 ## Rules and scope
 
@@ -164,9 +209,9 @@ are outside the sequential fragment.
 - Ordinary scalar expressions have zero foreground cost. This is a bound under
   the supplied peripheral cost model, not a complete CPU timing model.
 
-This remains a concrete sequential checker. Unknown calls, loops,
+Outside the bounded async forms, this remains a concrete sequential checker. Unknown calls, loops,
 assignment, macros in checked bodies, mixed early-return/fallthrough branches,
-transient states, async execution, clock changes, and unsupported Rust constructs
+Rust `async`/`.await`, clock changes, and unsupported Rust constructs
 produce errors. Generic typestates and type aliases are not resolved. General
 `Option`/`Result` combinators and dynamic dispatch need additional rules.
 
@@ -195,6 +240,24 @@ which each arm leaves every peripheral. If one arm can leave a peripheral in a
 more expensive state, the diagnostic lists the resulting states and shows the
 extra background cost that subsequent commands may pay. Branches whose arms end
 at the same cost do not produce this diagnostic.
+
+Burn analysis also recognizes repeated active sessions. When a peripheral is
+torn down, remains unused, and is restored to the same state before its next use,
+Heliod compares the written teardown/idle/setup sequence with keeping the
+peripheral active across the interval. If staying active is cheaper, it reports a
+batching opportunity with both costs and the potential saving. The interval may
+contain checked helper calls and branches; branches use their maximum cost. Any
+intervening operation on the peripheral is replayed in the retained active state.
+The recommendation is emitted only if every such operation remains available,
+preserves the expected state, and the resulting schedule is cheaper.
+
+Transition-boundary analysis reports expensive states entered before their first
+required use and left after their last required use. It replays the intervening
+commands in the cheaper state, including checked helpers and maximum-cost branch
+arms, and compares the complete affected region after relocating the transition.
+The diagnostic reports how many commands the boundary can cross and the estimated
+saving. This is advisory: Heliod does not attempt to represent warm-up time or
+other intent that is absent from the state machine.
 
 Helper diagnostics identify the function whose bound is being computed and point
 to the operation or branch in the helper's source. Reports explain potential local

@@ -41,11 +41,41 @@ fn parking_model(states: &str, ready_off: usize, off_idle: usize) -> Peripheral 
     )
     .unwrap()
 }
+
+fn batching_model(on_cost: usize, start_cost: usize, stop_cost: usize) -> Peripheral {
+    model(
+        &format!("(Off,cost:0),(On,cost:{on_cost})"),
+        &format!(
+            r#"struct Registers {{
+                #[RegAttributes([Off], StateChange(On, [Task::SET], on), cost = {start_cost})]
+                on: WriteOnly<u32, Task::Register>,
+                #[RegAttributes([On], StateChange(Off, [Task::SET], off), cost = {stop_cost})]
+                off: WriteOnly<u32, Task::Register>,
+                #[RegAttributes([Off, On], ReadOnly, cost = 0)]
+                data: ReadOnly<u32, Task::Register>,
+            }}"#
+        ),
+    )
+    .unwrap()
+}
 fn check(source: &str) -> syn::Result<Vec<(String, usize)>> {
     checking::check(&syn::parse_str(source)?, &[model(STATES, REGISTERS)?])
 }
 fn cost(source: &str) -> usize {
     check(source).unwrap()[0].1
+}
+
+fn async_model(states: &str) -> Peripheral {
+    model(
+        states,
+        r#"struct Registers {
+            #[RegAttributes([Off], StateChange(Reading, [Task::SET], start), cost = 3)]
+            start: WriteOnly<u32, Task::Register>,
+            #[RegAttributes([Reading], StateChange(Off, [Task::SET], off), cost = 4)]
+            stop: WriteOnly<u32, Task::Register>,
+        }"#,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -172,6 +202,14 @@ fn inferred_driver_fields_do_not_need_an_abacus_cell() {
     .unwrap();
     assert_eq!(reports, vec![("api::Driver::read".into(), 11)]);
 }
+
+#[test]
+fn inferred_register_operations_accept_qualified_constants() {
+    let reports =
+        check("fn read(p:&TestRegisters){p.into_start();p.data.read(Task::ENABLE);}").unwrap();
+    assert_eq!(reports, vec![("read".into(), 10)]);
+}
+
 #[test]
 fn actual_rust_api_costs_follow_state_changes_and_rebinding() {
     assert_eq!(cost("fn sample(p:TestRegisters<Off>)->TestRegisters<Off>{let p=p.into_start();let x=p.data.get();p.into_off()}"),11);
@@ -388,6 +426,7 @@ fn command_count(summary: &checking::ControlFlowSummary) -> usize {
         checking::ControlFlowSummary::Command(_) => 1,
         checking::ControlFlowSummary::Sequence(parts)
         | checking::ControlFlowSummary::Branch(parts) => parts.iter().map(command_count).sum(),
+        checking::ControlFlowSummary::Scale(factor, summary) => factor * command_count(summary),
     }
 }
 
@@ -517,7 +556,7 @@ fn burn_analysis_suggests_staying_on_when_off_transitions_cost_more() {
 }
 
 #[test]
-fn burn_analysis_ignores_intervals_that_use_the_peripheral() {
+fn burn_analysis_can_batch_across_compatible_peripheral_uses() {
     let source = "fn f(p:TestRegisters<Ready>)->TestRegisters<Ready>{let p=p.into_off();p.data.get();let p=p.into_idle();p.into_ready()}";
     let report = checking::analyze(
         &syn::parse_str(source).unwrap(),
@@ -531,7 +570,7 @@ fn burn_analysis_ignores_intervals_that_use_the_peripheral() {
     assert!(report
         .diagnostics
         .iter()
-        .all(|diagnostic| !diagnostic.message.contains("burn bug")));
+        .any(|diagnostic| diagnostic.message.contains("batching opportunity")));
 }
 
 #[test]
@@ -592,6 +631,148 @@ fn burn_analysis_sees_unused_commands_inside_a_function_call() {
 }
 
 #[test]
+fn burn_analysis_reports_profitable_session_batching() {
+    let source = "fn f(p:TestRegisters<On>)->TestRegisters<On>{p.data.get();let p=p.into_off();let _=0;let p=p.into_on();p.data.get();p}";
+    let report =
+        checking::analyze(&syn::parse_str(source).unwrap(), &[batching_model(5, 6, 6)]).unwrap();
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("batching opportunity"))
+        .unwrap();
+    assert!(diagnostic.message.contains("torn down to Off"));
+    assert!(diagnostic.message.contains("restored to On"));
+    assert!(diagnostic.message.contains("costs 5 instead of 12"));
+    assert!(diagnostic.message.contains("saving 7"));
+}
+
+#[test]
+fn burn_analysis_does_not_batch_when_staying_active_costs_more() {
+    let source = "fn f(p:TestRegisters<On>)->TestRegisters<On>{p.data.get();let p=p.into_off();let _=0;let _=0;let _=0;let p=p.into_on();p.data.get();p}";
+    let report =
+        checking::analyze(&syn::parse_str(source).unwrap(), &[batching_model(5, 1, 1)]).unwrap();
+    assert!(report
+        .diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.message.contains("batching opportunity")));
+}
+
+#[test]
+fn burn_analysis_batches_across_an_operation_valid_in_the_active_state() {
+    let source = "fn f(p:TestRegisters<On>)->TestRegisters<On>{p.data.get();let p=p.into_off();p.data.get();let p=p.into_on();p.data.get();p}";
+    let report =
+        checking::analyze(&syn::parse_str(source).unwrap(), &[batching_model(5, 6, 6)]).unwrap();
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("batching opportunity")));
+}
+
+#[test]
+fn burn_analysis_does_not_batch_when_an_intervening_operation_requires_the_parked_state() {
+    let peripheral = model(
+        "(Off,cost:0),(On,cost:5)",
+        r#"struct Registers {
+            #[RegAttributes([Off], StateChange(On, [Task::SET], on), cost = 6)]
+            on: WriteOnly<u32, Task::Register>,
+            #[RegAttributes([On], StateChange(Off, [Task::SET], off), cost = 6)]
+            off: WriteOnly<u32, Task::Register>,
+            #[RegAttributes([Off], ReadOnly, cost = 0)]
+            data: ReadOnly<u32, Task::Register>,
+        }"#,
+    )
+    .unwrap();
+    let source = "fn f(p:TestRegisters<On>)->TestRegisters<On>{let p=p.into_off();p.data.get();let p=p.into_on();p}";
+    let report = checking::analyze(&syn::parse_str(source).unwrap(), &[peripheral]).unwrap();
+    assert!(report
+        .diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.message.contains("batching opportunity")));
+}
+
+#[test]
+fn burn_analysis_batches_across_helpers_and_uses_maximum_branch_cost() {
+    let source = "mod api{fn prepare(b:bool){if b{let _=0;}else{let _=0;let _=0;}}fn f(p:TestRegisters<On>,b:bool)->TestRegisters<On>{p.data.get();let p=p.into_off();prepare(b);let p=p.into_on();p.data.get();p}}";
+    let report =
+        checking::analyze(&syn::parse_str(source).unwrap(), &[batching_model(2, 6, 6)]).unwrap();
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("batching opportunity"))
+        .unwrap();
+    assert!(
+        diagnostic.message.contains("costs 6 instead of 12"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn burn_analysis_reports_an_enable_transition_that_occurs_too_early() {
+    let source = "fn f(p:TestRegisters<Off>)->TestRegisters<Off>{let p=p.into_on();let _=0;let _=0;p.data.get();p.into_off()}";
+    let report =
+        checking::analyze(&syn::parse_str(source).unwrap(), &[batching_model(5, 6, 6)]).unwrap();
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("enables TestRegisters too early")
+        })
+        .unwrap();
+    assert!(diagnostic.message.contains("past 2 independent command(s)"));
+    assert!(diagnostic.message.contains("costs 6 instead of 16"));
+    assert!(diagnostic.message.contains("saving 10"));
+}
+
+#[test]
+fn burn_analysis_reports_a_disable_transition_that_occurs_too_late() {
+    let source =
+        "fn f(p:TestRegisters<On>)->TestRegisters<Off>{p.data.get();let _=0;let _=0;p.into_off()}";
+    let report =
+        checking::analyze(&syn::parse_str(source).unwrap(), &[batching_model(5, 6, 6)]).unwrap();
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("disables TestRegisters too late")
+        })
+        .unwrap();
+    assert!(diagnostic
+        .message
+        .contains("before 2 independent command(s)"));
+    assert!(diagnostic.message.contains("costs 6 instead of 16"));
+    assert!(diagnostic.message.contains("saving 10"));
+}
+
+#[test]
+fn transition_boundary_analysis_ignores_adjacent_required_uses() {
+    let source = "fn f(p:TestRegisters<Off>)->TestRegisters<Off>{let p=p.into_on();p.data.get();p.into_off()}";
+    let report =
+        checking::analyze(&syn::parse_str(source).unwrap(), &[batching_model(5, 6, 6)]).unwrap();
+    assert!(report.diagnostics.iter().all(|diagnostic| {
+        !diagnostic.message.contains("too early") && !diagnostic.message.contains("too late")
+    }));
+}
+
+#[test]
+fn transition_boundary_analysis_uses_helpers_and_maximum_branch_length() {
+    let source = "mod api{fn prepare(b:bool){if b{let _=0;}else{let _=0;let _=0;}}fn f(p:TestRegisters<Off>,b:bool)->TestRegisters<On>{let p=p.into_on();prepare(b);p.data.get();p}}";
+    let report =
+        checking::analyze(&syn::parse_str(source).unwrap(), &[batching_model(5, 6, 6)]).unwrap();
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("too early"))
+        .unwrap();
+    assert!(diagnostic.message.contains("past 3 independent command(s)"));
+    assert!(diagnostic.message.contains("saving 15"));
+}
+
+#[test]
 fn operation_reports_a_cheaper_possible_state() {
     let source = "fn f(p:TestRegisters<Off>, b:bool) { let p = if b { p.into_start().into() } else { p.into() }; p.data.get(); }";
     let messages = diagnostic_messages(source);
@@ -626,4 +807,119 @@ fn equal_cost_states_do_not_produce_optimization_diagnostics() {
 fn a_branch_that_rejoins_in_the_same_state_is_not_reported() {
     let source = "fn f(p:TestRegisters<Off>, b:bool) { let p = if b { let p = p.into_start(); p.into_off() } else { p }; }";
     assert!(diagnostic_messages(source).is_empty());
+}
+
+#[test]
+fn async_timeout_uses_the_maximum_of_completion_and_bounded_recovery() {
+    let item = syn::parse_str(
+        "fn f(p:TestRegisters<Off>){let p=p.into_start();let task=heliod_async(p,|p|{let _=0;p.sync_state()});heliod_await(task,10,|p|{p.sync_state()});}",
+    )
+    .unwrap();
+    let costs =
+        checking::check(&item, &[async_model("(Off,cost:1),(Reading,*T*,cost:5)")]).unwrap();
+    // start (3) + max(normal: one Reading command + sync = 9,
+    // timeout: ten Reading ticks + sync = 54)
+    assert_eq!(costs[0].1, 57);
+}
+
+#[test]
+fn async_timeout_charges_ambient_peripherals_for_every_step() {
+    let item = syn::parse_str(
+        "fn f(p:TestRegisters<Off>,q:TestRegisters<Off>){let p=p.into_start();let task=heliod_async(p,|p|{p.sync_state()});heliod_await(task,2,|p|{p.sync_state()});let q=q.into_start();q.sync_state();}",
+    )
+    .unwrap();
+    let costs =
+        checking::check(&item, &[async_model("(Off,cost:1),(Reading,*T*,cost:5)")]).unwrap();
+    // p start: 3 + q background 1
+    // p await timeout: 2 * (p transient 5 + q Off 1), followed by recovery
+    // 4 + q background 1. q start and recovery each also charge p Off once.
+    assert_eq!(costs[0].1, 30);
+}
+
+#[test]
+fn async_timeout_charges_other_captured_peripherals_as_transient() {
+    let item = syn::parse_str(
+        "fn f(p:TestRegisters<Off>,q:TestRegisters<Off>){let p=p.into_start();let p_task=heliod_async(p,|p|{p.sync_state()});let q=q.into_start();let q_task=heliod_async(q,|q|{q.sync_state()});heliod_await(p_task,2,|p|{p.sync_state()});heliod_await(q_task,1,|q|{q.sync_state()});}",
+    )
+    .unwrap();
+    let costs =
+        checking::check(&item, &[async_model("(Off,cost:1),(Reading,*T*,cost:5)")]).unwrap();
+    // Starts: (3 + q Off 1) + 3. First timeout charges both transient
+    // peripherals: 2 * (5 + 5) + 4. The second charges q transient and p Off:
+    // 1 * (5 + 1), followed by recovery 4 + p Off background 1.
+    assert_eq!(costs[0].1, 42);
+}
+
+#[test]
+fn async_capture_prevents_software_access_before_await() {
+    let item = syn::parse_str(
+        "fn f(p:TestRegisters<Off>){let p=p.into_start();let task=heliod_async(p,|p|{p.sync_state()});p.sync_state();heliod_await(task,1,|p|{p.sync_state()});}",
+    )
+    .unwrap();
+    let error =
+        checking::check(&item, &[async_model("(Off,cost:1),(Reading,*T*,cost:5)")]).unwrap_err();
+    assert!(error.to_string().contains("captured peripheral"));
+}
+
+#[test]
+fn async_completion_and_fallback_must_both_be_stable() {
+    let item = syn::parse_str(
+        "fn f(p:TestRegisters<Off>){let p=p.into_start();let task=heliod_async(p,|p|{p.sync_state()});heliod_await(task,1,|p|{p});}",
+    )
+    .unwrap();
+    let error =
+        checking::check(&item, &[async_model("(Off,cost:1),(Reading,*T*,cost:5)")]).unwrap_err();
+    assert!(error.to_string().contains("only stable states"));
+}
+
+#[test]
+fn inferred_async_states_follow_the_same_capture_and_join_rules() {
+    let item = syn::parse_str(
+        "fn f(p:TestRegisters){p.into_start();let task=heliod_async(p,|p|{p.sync_state()});heliod_await(task,2,|p|{p.sync_state()});}",
+    )
+    .unwrap();
+    let costs =
+        checking::check(&item, &[async_model("(Off,cost:1),(Reading,*T*,cost:5)")]).unwrap();
+    assert_eq!(costs[0].1, 17);
+}
+
+#[test]
+fn async_transition_includes_transient_hardware_reachability() {
+    let peripheral = model(
+        "(Off,cost:1),(Reading,*T*,cost:5),(Waiting,*T*,cost:7)",
+        r#"struct Registers {
+            #[RegAttributes([Off], StateChange(Reading, [Task::SET], start), cost = 3)]
+            start: WriteOnly<u32, Task::Register>,
+            #[RegAttributes([Reading], StateChange(Waiting, [Task::SET], wait), cost = 1)]
+            wait: WriteOnly<u32, Task::Register>,
+            #[RegAttributes([Reading, Waiting], StateChange(Off, [Task::SET], off), cost = 4)]
+            stop: WriteOnly<u32, Task::Register>,
+        }"#,
+    )
+    .unwrap();
+    let item = syn::parse_str(
+        "fn f(p:TestRegisters<Off>){let p=p.into_start();let task=heliod_async(p,|p|{p.sync_state()});heliod_await(task,2,|p|{p.sync_state()});}",
+    )
+    .unwrap();
+    // HWReach(Reading) includes Waiting, so the timeout uses max(5, 7).
+    assert_eq!(checking::check(&item, &[peripheral]).unwrap()[0].1, 21);
+}
+
+#[test]
+fn symbolic_async_timeout_is_reported_as_a_scaled_state_cost() {
+    let item = syn::parse_str(
+        "fn f(p:TestRegisters<Off>){let p=p.into_start();let task=heliod_async(p,|p|{p.sync_state()});heliod_await(task,3,|p|{p.sync_state()});}",
+    )
+    .unwrap();
+    let report = checking::analyze(
+        &item,
+        &[async_model(
+            "(Off,cost:off_cost),(Reading,*T*,cost:reading_cost)",
+        )],
+    )
+    .unwrap();
+    let cost = &report.reported_costs[0].1;
+    assert!(cost.contains("3 * (reading_cost)"), "{cost}");
+    assert!(cost.contains("off_cost -> reading_cost"), "{cost}");
+    assert!(cost.contains("reading_cost -> off_cost"), "{cost}");
 }

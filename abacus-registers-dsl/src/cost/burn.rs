@@ -56,6 +56,9 @@ fn inspect(
                 inspect(function, arm, device, model, diagnostics);
             }
         }
+        ControlFlowSummary::Scale(_, summary) => {
+            inspect(function, summary, device, model, diagnostics);
+        }
         ControlFlowSummary::Empty | ControlFlowSummary::Command(_) => {}
     }
 }
@@ -67,6 +70,8 @@ fn inspect_sequence(
     model: &Peripheral,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    inspect_transition_boundaries(function, parts, device, model, diagnostics);
+
     let mut clusters = Vec::new();
     let mut index = 0;
     while index < parts.len() {
@@ -84,11 +89,7 @@ fn inspect_sequence(
     for pair in clusters.windows(2) {
         let (entry_start, entry_end) = pair[0];
         let (exit_start, exit_end) = pair[1];
-        if entry_end == exit_start
-            || parts[entry_end..exit_start]
-                .iter()
-                .any(|part| uses_device(part, device))
-        {
+        if entry_end == exit_start {
             continue;
         }
         let entry = transitions(&parts[entry_start..entry_end], device);
@@ -117,6 +118,7 @@ fn inspect_sequence(
         }
 
         let middle = ControlFlowSummary::Sequence(parts[entry_end..exit_start].to_vec());
+        let middle_uses_device = has_device_event(&middle, device);
         let written = ControlFlowSummary::Sequence(parts[entry_start..exit_end].to_vec()).cost();
         let entry_other_background =
             other_background(command(&parts[entry_start]).unwrap(), device);
@@ -127,6 +129,12 @@ fn inspect_sequence(
             if state.transient {
                 continue;
             }
+            // Replaying operations is used to prove that teardown/setup can be
+            // removed while retaining the original active state. Choosing a
+            // different operating state remains an unused-interval analysis.
+            if middle_uses_device && candidate != source {
+                continue;
+            }
             let Some(before) = shortest_path(model, source, candidate, entry_other_background)
             else {
                 continue;
@@ -135,9 +143,15 @@ fn inspect_sequence(
             else {
                 continue;
             };
-            let total = before.cost
-                + parked_cost(&middle, device, state.cost.concrete().unwrap())
-                + after.cost;
+            let Some((middle_cost, middle_states)) =
+                alternative_cost(&middle, device, model, BTreeSet::from([candidate.clone()]))
+            else {
+                continue;
+            };
+            if middle_states != BTreeSet::from([candidate.clone()]) {
+                continue;
+            }
+            let total = before.cost + middle_cost + after.cost;
             if total < written
                 && best
                     .as_ref()
@@ -163,6 +177,22 @@ fn inspect_sequence(
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join(" -> ");
+        if candidate == source
+            && required == source
+            && alternative_operations.is_empty()
+            && model.states[source].cost.concrete().unwrap()
+                > model.states[parked].cost.concrete().unwrap()
+        {
+            diagnostics.push(Diagnostic {
+                span: first.span,
+                message: format!(
+                    "Heliod: {function} contains a batching opportunity for {}. The peripheral is torn down to {parked} and restored to {source} without being used in between. Removing [{written_operations}] and keeping it in {source} costs {alternative} instead of {written}, saving {}. The useful operations on either side may be batched into one active session.",
+                    model.registers,
+                    written - alternative
+                ),
+            });
+            continue;
+        }
         diagnostics.push(Diagnostic {
             span: first.span,
             message: format!(
@@ -174,11 +204,141 @@ fn inspect_sequence(
     }
 }
 
+fn inspect_transition_boundaries(
+    function: &str,
+    parts: &[ControlFlowSummary],
+    device: usize,
+    model: &Peripheral,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (index, part) in parts.iter().enumerate() {
+        let Some(boundary) = transition(part, device) else {
+            continue;
+        };
+        let (Some(source), Some(target)) =
+            (singleton(&boundary.source), singleton(&boundary.target))
+        else {
+            continue;
+        };
+        let source_cost = model.states[source].cost.concrete().unwrap();
+        let target_cost = model.states[target].cost.concrete().unwrap();
+
+        if target_cost > source_cost {
+            let Some(use_index) = parts[index + 1..]
+                .iter()
+                .position(|part| has_device_event(part, device))
+                .map(|offset| index + 1 + offset)
+            else {
+                continue;
+            };
+            if use_index == index + 1 || !is_nontransition_use(&parts[use_index], device) {
+                continue;
+            }
+            let gap = ControlFlowSummary::Sequence(parts[index + 1..use_index].to_vec());
+            let Some((alternative_gap, output)) =
+                alternative_cost(&gap, device, model, BTreeSet::from([source.to_owned()]))
+            else {
+                continue;
+            };
+            if output != BTreeSet::from([source.to_owned()]) {
+                continue;
+            }
+            let Some(next_command) = command(&parts[use_index]) else {
+                continue;
+            };
+            let written = part.cost() + gap.cost();
+            let moved = boundary.cost + other_background(next_command, device) + alternative_gap;
+            if moved < written {
+                diagnostics.push(Diagnostic {
+                    span: boundary.span,
+                    message: format!(
+                        "Heliod: {function} enables {} too early with `{}`. Moving the transition from {source} to {target} past {} independent command(s), immediately before the first peripheral use, costs {moved} instead of {written}, saving {}.",
+                        model.registers,
+                        boundary.operation,
+                        command_count(&gap),
+                        written - moved
+                    ),
+                });
+            }
+        }
+
+        if source_cost > target_cost {
+            let Some(use_index) = parts[..index]
+                .iter()
+                .rposition(|part| has_device_event(part, device))
+            else {
+                continue;
+            };
+            if use_index + 1 == index || !is_nontransition_use(&parts[use_index], device) {
+                continue;
+            }
+            let gap = ControlFlowSummary::Sequence(parts[use_index + 1..index].to_vec());
+            let Some((alternative_gap, output)) =
+                alternative_cost(&gap, device, model, BTreeSet::from([target.to_owned()]))
+            else {
+                continue;
+            };
+            if output != BTreeSet::from([target.to_owned()]) {
+                continue;
+            }
+            let Some(first_gap_command) = first_command(&gap) else {
+                continue;
+            };
+            let written = gap.cost() + part.cost();
+            let moved =
+                boundary.cost + other_background(first_gap_command, device) + alternative_gap;
+            if moved < written {
+                diagnostics.push(Diagnostic {
+                    span: boundary.span,
+                    message: format!(
+                        "Heliod: {function} disables {} too late with `{}`. Moving the transition from {source} to {target} before {} independent command(s), immediately after the last peripheral use, costs {moved} instead of {written}, saving {}.",
+                        model.registers,
+                        boundary.operation,
+                        command_count(&gap),
+                        written - moved
+                    ),
+                });
+            }
+        }
+    }
+}
+
 fn command(summary: &ControlFlowSummary) -> Option<&CommandSummary> {
     if let ControlFlowSummary::Command(command) = summary {
         Some(command)
     } else {
         None
+    }
+}
+
+fn first_command(summary: &ControlFlowSummary) -> Option<&CommandSummary> {
+    match summary {
+        ControlFlowSummary::Command(command) => Some(command),
+        ControlFlowSummary::Sequence(parts) => parts.iter().find_map(first_command),
+        ControlFlowSummary::Scale(_, summary) => first_command(summary),
+        ControlFlowSummary::Empty | ControlFlowSummary::Branch(_) => None,
+    }
+}
+
+fn is_nontransition_use(summary: &ControlFlowSummary, device: usize) -> bool {
+    let Some(command) = command(summary) else {
+        return false;
+    };
+    let events = command
+        .events
+        .iter()
+        .filter(|event| event.device == device)
+        .collect::<Vec<_>>();
+    !events.is_empty() && events.iter().all(|event| !event.transition)
+}
+
+fn command_count(summary: &ControlFlowSummary) -> usize {
+    match summary {
+        ControlFlowSummary::Empty => 0,
+        ControlFlowSummary::Command(_) => 1,
+        ControlFlowSummary::Sequence(parts) => parts.iter().map(command_count).sum(),
+        ControlFlowSummary::Branch(arms) => arms.iter().map(command_count).max().unwrap_or(0),
+        ControlFlowSummary::Scale(factor, summary) => factor * command_count(summary),
     }
 }
 
@@ -208,15 +368,88 @@ fn singleton(states: &BTreeSet<String>) -> Option<&str> {
     (states.len() == 1).then(|| states.iter().next().unwrap().as_str())
 }
 
-fn uses_device(summary: &ControlFlowSummary, device: usize) -> bool {
+fn alternative_cost(
+    summary: &ControlFlowSummary,
+    device: usize,
+    model: &Peripheral,
+    states: BTreeSet<String>,
+) -> Option<(usize, BTreeSet<String>)> {
+    match summary {
+        ControlFlowSummary::Empty => Some((0, states)),
+        ControlFlowSummary::Command(command) => {
+            let mut foreground = command.foreground;
+            let background_states = states.clone();
+            let mut next = states;
+            for event in command.events.iter().filter(|event| event.device == device) {
+                if event.transition {
+                    return None;
+                }
+                foreground = foreground.checked_sub(event.cost)?;
+                let mut targets = BTreeSet::new();
+                let mut operation_cost = 0;
+                for state in &next {
+                    let operation = model
+                        .operations
+                        .get(&(state.clone(), event.operation.clone()))?;
+                    if operation.transition {
+                        return None;
+                    }
+                    targets.insert(operation.target.clone());
+                    operation_cost = operation_cost.max(operation.cost.concrete()?);
+                }
+                foreground += operation_cost;
+                next = targets;
+            }
+            let background = command
+                .background
+                .iter()
+                .filter(|charge| charge.device != device)
+                .map(|charge| charge.cost)
+                .sum::<usize>()
+                + background_states
+                    .iter()
+                    .filter_map(|state| model.states[state].cost.concrete())
+                    .max()
+                    .unwrap_or(0);
+            Some((foreground + background, next))
+        }
+        ControlFlowSummary::Sequence(parts) => {
+            let mut cost = 0;
+            let mut current = states;
+            for part in parts {
+                let (part_cost, output) = alternative_cost(part, device, model, current)?;
+                cost += part_cost;
+                current = output;
+            }
+            Some((cost, current))
+        }
+        ControlFlowSummary::Branch(arms) => {
+            let mut cost = 0;
+            let mut outputs = BTreeSet::new();
+            for arm in arms {
+                let (arm_cost, output) = alternative_cost(arm, device, model, states.clone())?;
+                cost = cost.max(arm_cost);
+                outputs.extend(output);
+            }
+            Some((cost, outputs))
+        }
+        ControlFlowSummary::Scale(factor, summary) => {
+            let (cost, output) = alternative_cost(summary, device, model, states)?;
+            Some((factor * cost, output))
+        }
+    }
+}
+
+fn has_device_event(summary: &ControlFlowSummary, device: usize) -> bool {
     match summary {
         ControlFlowSummary::Empty => false,
         ControlFlowSummary::Command(command) => {
             command.events.iter().any(|event| event.device == device)
         }
         ControlFlowSummary::Sequence(parts) | ControlFlowSummary::Branch(parts) => {
-            parts.iter().any(|part| uses_device(part, device))
+            parts.iter().any(|part| has_device_event(part, device))
         }
+        ControlFlowSummary::Scale(_, summary) => has_device_event(summary, device),
     }
 }
 
@@ -227,31 +460,6 @@ fn other_background(command: &CommandSummary, device: usize) -> usize {
         .filter(|charge| charge.device != device)
         .map(|charge| charge.cost)
         .sum()
-}
-
-fn parked_cost(summary: &ControlFlowSummary, device: usize, background: usize) -> usize {
-    match summary {
-        ControlFlowSummary::Empty => 0,
-        ControlFlowSummary::Command(command) => {
-            command.foreground
-                + command
-                    .background
-                    .iter()
-                    .filter(|charge| charge.device != device)
-                    .map(|charge| charge.cost)
-                    .sum::<usize>()
-                + background
-        }
-        ControlFlowSummary::Sequence(parts) => parts
-            .iter()
-            .map(|part| parked_cost(part, device, background))
-            .sum(),
-        ControlFlowSummary::Branch(arms) => arms
-            .iter()
-            .map(|arm| parked_cost(arm, device, background))
-            .max()
-            .unwrap_or(0),
-    }
 }
 
 fn shortest_path(
