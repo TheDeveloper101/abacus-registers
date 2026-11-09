@@ -9,9 +9,28 @@ use crate::parsing::Cost;
 use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use syn::{
-    spanned::Spanned, Block, Error, Expr, FnArg, GenericArgument, Item, Pat, PathArguments, Result,
-    Signature, Stmt, Type,
+    parse::{Parse, ParseStream},
+    spanned::Spanned,
+    Block, Error, Expr, FnArg, GenericArgument, Item, Pat, PathArguments, Result, Signature, Stmt,
+    Token, Type,
 };
+
+struct BoundedLoop {
+    bound: usize,
+    body: Block,
+}
+
+impl Parse for BoundedLoop {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let bound = input.parse::<syn::LitInt>()?.base10_parse()?;
+        input.parse::<Token![,]>()?;
+        let body = input.parse()?;
+        if !input.is_empty() {
+            return Err(input.error("expected `heliod_loop!(bound, { ... })`"));
+        }
+        Ok(Self { bound, body })
+    }
+}
 
 pub type States = BTreeSet<String>;
 #[derive(Clone, PartialEq, Eq)]
@@ -349,6 +368,7 @@ pub struct Report {
     #[allow(dead_code)]
     pub costs: Vec<(String, usize)>,
     pub reported_costs: Vec<(String, String)>,
+    pub per_iteration: BTreeSet<String>,
     #[allow(dead_code)]
     pub summaries: Vec<(String, ControlFlowSummary)>,
     pub diagnostics: Vec<Diagnostic>,
@@ -363,6 +383,7 @@ struct Checker<'a> {
     inferred: BTreeMap<String, super::inference::Contract>,
     operations: &'a BTreeMap<String, operation::Contract>,
     opaque_types: BTreeSet<String>,
+    per_iteration: BTreeSet<String>,
 }
 
 #[cfg(test)]
@@ -399,6 +420,7 @@ pub fn analyze_with_operations(
             .flat_map(|operation| operation.parameter_types.iter().cloned())
             .filter(|name| models.iter().all(|model| model.registers != *name))
             .collect(),
+        per_iteration: BTreeSet::new(),
     };
     checker.collect(item, "")?;
     if checker.functions.is_empty() {
@@ -442,6 +464,7 @@ pub fn analyze_with_operations(
     Ok(Report {
         costs: reports,
         reported_costs,
+        per_iteration: checker.per_iteration,
         summaries,
         diagnostics: checker.diagnostics,
     })
@@ -888,7 +911,13 @@ impl Checker<'_> {
                 Stmt::Expr(expression, _) => Some(expression),
                 _ => None,
             };
-            let has_outer_command = !matches!(statement, Stmt::Expr(Expr::Block(_), _));
+            let ignored_macro = matches!(
+                statement,
+                Stmt::Macro(statement)
+                    if statement.mac.path.segments.last().is_some_and(|s| s.ident == "heliod_ignore")
+            );
+            let has_outer_command =
+                !ignored_macro && !matches!(statement, Stmt::Expr(Expr::Block(_), _));
             let background = if !has_outer_command {
                 Vec::new()
             } else {
@@ -928,6 +957,7 @@ impl Checker<'_> {
                     }
                     value
                 }
+                Stmt::Macro(_) if ignored_macro => Evaluation::new(Value::Scalar, 0),
                 _ => {
                     return Err(Error::new(
                         statement.span(),
@@ -1106,6 +1136,30 @@ impl Checker<'_> {
                 result.cost += condition.cost;
                 Ok(result)
             }
+            Expr::Loop(loop_expression) => {
+                self.loop_body(&loop_expression.body, loop_expression.span(), context)
+            }
+            Expr::Macro(expression)
+                if expression
+                    .mac
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "heliod_loop") =>
+            {
+                let bounded: BoundedLoop = syn::parse2(expression.mac.tokens.clone())?;
+                self.bounded_loop_body(&bounded.body, bounded.bound, expression.span(), context)
+            }
+            Expr::Macro(expression)
+                if expression
+                    .mac
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "heliod_ignore") =>
+            {
+                Ok(Evaluation::new(Value::Scalar, 0))
+            }
             Expr::Match(branch) => self.match_states(branch, context),
             Expr::MethodCall(call) => self.method(call, context),
             Expr::Call(call) => self.call_expression(call, context, false),
@@ -1126,6 +1180,73 @@ impl Checker<'_> {
                 "unsupported expression; no cost bound can be reported",
             )),
         }
+    }
+
+    fn loop_body(
+        &mut self,
+        body: &Block,
+        span: proc_macro2::Span,
+        context: &mut Context,
+    ) -> Result<Evaluation> {
+        let before = context.clone();
+        let iteration = self.block(body, context)?;
+        if iteration.returned {
+            return Err(Error::new(
+                span,
+                "return inside a summarized loop is not supported",
+            ));
+        }
+        if before.devices.len() > context.devices.len()
+            || before
+                .devices
+                .iter()
+                .zip(&context.devices)
+                .any(|(left, right)| left.model != right.model || left.states != right.states)
+            || context
+                .devices
+                .iter()
+                .skip(before.devices.len())
+                .any(|device| !device.implicit || device.states != device.initial_states)
+            || before.captured != context.captured
+            || before.tasks.keys().ne(context.tasks.keys())
+            || before.guards.keys().ne(context.guards.keys())
+        {
+            return Err(Error::new(
+                span,
+                "a summarized loop iteration must leave every peripheral in its initial state",
+            ));
+        }
+        self.per_iteration.insert(self.function.clone());
+        let summary = iteration.summary;
+        let mut result = Evaluation::new(Value::Scalar, summary.cost());
+        result.summary = summary;
+        result.call_body_charged = true;
+        Ok(result)
+    }
+
+    fn bounded_loop_body(
+        &mut self,
+        body: &Block,
+        bound: usize,
+        span: proc_macro2::Span,
+        context: &mut Context,
+    ) -> Result<Evaluation> {
+        let mut iterations = Vec::with_capacity(bound);
+        for _ in 0..bound {
+            let iteration = self.block(body, context)?;
+            if iteration.returned {
+                return Err(Error::new(
+                    span,
+                    "return inside a summarized loop is not supported",
+                ));
+            }
+            iterations.push(iteration.summary);
+        }
+        let summary = sequence(iterations);
+        let mut result = Evaluation::new(Value::Scalar, summary.cost());
+        result.summary = summary;
+        result.call_body_charged = true;
+        Ok(result)
     }
 
     fn call_expression(

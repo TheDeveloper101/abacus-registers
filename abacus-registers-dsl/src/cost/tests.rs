@@ -273,7 +273,6 @@ fn unmodeled_work_is_rejected() {
     let item =
         syn::parse_str("fn f(p:TestRegisters<Off>)->TestRegisters<On>{p.into_start()}").unwrap();
     for body in [
-        "loop{}",
         "unknown();",
         "let mut x=1;x=2;",
         "assert!(true);",
@@ -283,6 +282,51 @@ fn unmodeled_work_is_rejected() {
     }
     let transient = model("(Off,cost:1),(On,*T*,cost:5)", REGISTERS).unwrap();
     assert!(checking::check(&item, &[transient]).is_err());
+}
+
+#[test]
+fn unbounded_loops_report_one_iteration() {
+    let item = syn::parse_str("fn sample(p:&TestRegisters<On>){loop{p.data.get();}}").unwrap();
+    let report = checking::analyze(&item, &[model(STATES, REGISTERS).unwrap()]).unwrap();
+    assert_eq!(report.costs, vec![("sample".into(), 7)]);
+    assert!(report.per_iteration.contains("sample"));
+}
+
+#[test]
+fn bounded_loops_multiply_the_iteration_cost() {
+    let item =
+        syn::parse_str("fn sample(p:&TestRegisters<On>){heliod_loop!(3,{p.data.get();})}").unwrap();
+    let report = checking::analyze(&item, &[model(STATES, REGISTERS).unwrap()]).unwrap();
+    assert_eq!(report.costs, vec![("sample".into(), 21)]);
+    assert!(!report.per_iteration.contains("sample"));
+}
+
+#[test]
+fn bounded_loops_propagate_states_between_iterations() {
+    let registers = r#"struct Registers {
+        #[RegAttributes([Off], StateChange(Middle, [Task::SET], advance), cost = 2)]
+        first: WriteOnly<u32, Task::Register>,
+        #[RegAttributes([Middle], StateChange(On, [Task::SET], advance), cost = 3)]
+        second: WriteOnly<u32, Task::Register>,
+    }"#;
+    let item =
+        syn::parse_str("fn sample(p:TestRegisters<Off>){heliod_loop!(2,{p.into_advance();})}")
+            .unwrap();
+    let report = checking::analyze(
+        &item,
+        &[model("(Off,cost:1),(Middle,cost:2),(On,cost:3)", registers).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(report.costs, vec![("sample".into(), 5)]);
+}
+
+#[test]
+fn summarized_loops_must_preserve_peripheral_states() {
+    let item = syn::parse_str("fn sample(p:TestRegisters<Off>){loop{p.into_start();}}").unwrap();
+    let error = checking::analyze(&item, &[model(STATES, REGISTERS).unwrap()])
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("initial state"), "{error}");
 }
 #[test]
 fn inferred_bounds_cover_enumerated_concrete_executions() {

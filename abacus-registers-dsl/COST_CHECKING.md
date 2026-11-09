@@ -58,6 +58,29 @@ original function is emitted unchanged; Rust still checks its types and ownershi
 programs are assumed to contain no recursive calls. Reports are emitted when the compiler expands the attribute; Cargo
 may replay cached compiler output without rerunning analysis.
 
+## Loops
+
+An ordinary `loop { ... }` is analyzed for one iteration. Its report says
+`Heliod cost per loop iteration` so that the number is not mistaken for a bound
+on the nonterminating computation. The iteration must return every modeled
+peripheral to the state in which that iteration began.
+
+Use `heliod_loop!(N, { ... })` when the iteration count is known. The macro runs
+the block exactly `N` times at runtime. Heliod analyzes the iterations in
+sequence, passing each iteration's resulting peripheral states into the next.
+When every iteration has the same cost this is equivalent to multiplying the
+one-iteration bound by `N`; otherwise Heliod sums the individual bounds:
+
+```rust
+heliod_loop!(10, {
+    sample(&mut sensor).await;
+});
+```
+
+`heliod_ignore!(expression)` executes an expression normally but excludes it
+from the selected peripheral model. It is intended for work such as application
+logging when the reported bound deliberately covers only one peripheral.
+
 Costs may instead be symbolic identifiers:
 
 ```rust

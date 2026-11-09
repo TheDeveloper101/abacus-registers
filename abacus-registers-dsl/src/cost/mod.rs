@@ -112,7 +112,11 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     operation::install(&operations, &mut models)?;
     let report = checking::analyze_with_operations(&item, &models, &operations)?;
     for (name, cost) in report.reported_costs {
-        eprintln!("Heliod cost for {name}: {cost}");
+        if report.per_iteration.contains(&name) {
+            eprintln!("Heliod cost per loop iteration for {name}: {cost}");
+        } else {
+            eprintln!("Heliod cost for {name}: {cost}");
+        }
     }
     let warnings = diagnostics::warnings(report.diagnostics);
     Ok(quote! { #item #warnings })
