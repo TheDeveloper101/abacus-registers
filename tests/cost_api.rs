@@ -234,6 +234,33 @@ mod api {
     }
 }
 
+#[heliod(hardware::TestCost)]
+mod opaque_userspace_api {
+    use abacus_registers::heliod_operation;
+
+    pub struct EmbassyTemp;
+
+    async fn platform_temperature_read(_temp: &mut EmbassyTemp) -> Result<i32, ()> {
+        Ok(2350)
+    }
+
+    #[heliod_operation(
+        peripheral = crate::hardware::TestCost,
+        from = Off,
+        to = Off,
+        cost = nrf52_temperature_read,
+        background_steps = 10
+    )]
+    async fn read_temperature(temp: &mut EmbassyTemp) -> Result<i32, ()> {
+        platform_temperature_read(temp).await
+    }
+
+    pub async fn sample_twice(temp: &mut EmbassyTemp) {
+        let _ = read_temperature(temp).await;
+        let _ = read_temperature(temp).await;
+    }
+}
+
 use hardware::*;
 #[test]
 fn original_rust_signatures_are_preserved_without_executing_mmio() {

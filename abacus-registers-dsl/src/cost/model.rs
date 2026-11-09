@@ -5,16 +5,19 @@ use crate::{
 use std::collections::BTreeMap;
 use syn::{spanned::Spanned, DeriveInput, Error, Result};
 
+#[derive(Clone)]
 pub struct StateInfo {
     pub ty: String,
     pub cost: Cost,
     pub transient: bool,
 }
+#[derive(Clone)]
 pub struct Operation {
     pub target: String,
     pub cost: Cost,
     pub transition: bool,
 }
+#[derive(Clone)]
 pub struct Peripheral {
     pub registers: String,
     pub state_enum: String,

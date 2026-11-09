@@ -4,7 +4,7 @@ use syn::{
     bracketed,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
-    Ident,
+    Ident, Path, Token,
 };
 
 use std::collections::{hash_set::HashSet, HashMap};
@@ -17,11 +17,26 @@ mod custom_keywords {
     syn::custom_keyword!(registers);
     syn::custom_keyword!(states);
     syn::custom_keyword!(register_base_addr);
+    syn::custom_keyword!(backend);
+    syn::custom_keyword!(external);
+    syn::custom_keyword!(transitions);
+}
+
+pub enum Backend {
+    Internal,
+    External(Path),
+}
+
+pub struct Transition {
+    pub from: State,
+    pub to: State,
 }
 
 pub struct MacroInput {
     pub peripheral_name: String,
+    pub backend: Backend,
     pub state_definitions: Vec<StateDefinition>,
+    pub transitions: Vec<Transition>,
 }
 
 impl MacroInput {
@@ -149,6 +164,7 @@ impl MacroInput {
 
                 if !created_states.contains(&state.state_name) {
                     output.extend(quote! {
+                        #[allow(missing_docs)]
                         pub struct #struct_name {
                             #(#fields),*
                         }
@@ -207,6 +223,7 @@ impl MacroInput {
             let substate_ident = format_ident!("{}", substate);
 
             output.extend(quote! {
+                #[allow(missing_docs)]
                 pub struct #substate_ident {}
 
                 impl SubState for #substate_ident {}
@@ -250,28 +267,33 @@ impl Parse for MacroInput {
             )
         })?;
 
-        let _: custom_keywords::register_base_addr = input.parse().map_err(|_| {
-            syn::Error::new(
-                input.span(),
-                "Abacus Macro - Expected 'register_base_addr' keyword",
-            )
-        })?;
-        let _: syn::Token![=] = input.parse().map_err(|_| {
-            syn::Error::new(
-                input.span(),
-                "Abacus Macro - Expected '=' after register_base_addr",
-            )
-        })?;
-        let _base_addr: syn::LitInt = input.parse().map_err(|_| {
-            syn::Error::new(
-                input.span(),
-                "Abacus Macro - Expected integer literal for register_base_addr",
-            )
-        })?;
+        let backend = if input.peek(custom_keywords::backend) {
+            input.parse::<custom_keywords::backend>()?;
+            input.parse::<Token![=]>()?;
+            input.parse::<custom_keywords::external>()?;
+            let content;
+            syn::parenthesized!(content in input);
+            Backend::External(content.parse()?)
+        } else {
+            let _: custom_keywords::register_base_addr = input.parse().map_err(|_| {
+                syn::Error::new(
+                    input.span(),
+                    "Abacus Macro - Expected 'register_base_addr' or 'backend = external(...)'",
+                )
+            })?;
+            input.parse::<Token![=]>()?;
+            input.parse::<syn::LitInt>().map_err(|_| {
+                syn::Error::new(
+                    input.span(),
+                    "Abacus Macro - Expected integer literal for register_base_addr",
+                )
+            })?;
+            Backend::Internal
+        };
         let _: syn::Token![,] = input.parse().map_err(|_| {
             syn::Error::new(
                 input.span(),
-                "Abacus Macro - Expected ',' after register_base_addr value",
+                "Abacus Macro - Expected ',' after backend specification",
             )
         })?;
 
@@ -295,12 +317,43 @@ impl Parse for MacroInput {
                 )
             })?;
 
-        if input.peek(syn::Token![,]) {
-            input.parse::<syn::Token![,]>()?;
+        if input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+        }
+
+        let transitions = if input.peek(custom_keywords::transitions) {
+            input.parse::<custom_keywords::transitions>()?;
+            input.parse::<Token![=]>()?;
+            let content;
+            bracketed!(content in input);
+            let transitions = content.parse_terminated(
+                |entry| {
+                    let from = entry.parse()?;
+                    entry.parse::<Token![=>]>()?;
+                    let to = entry.parse()?;
+                    Ok(Transition { from, to })
+                },
+                Token![,],
+            )?;
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+            transitions.into_iter().collect()
+        } else {
+            Vec::new()
+        };
+
+        if !input.is_empty() {
+            return Err(input.error("unexpected process_register_block option"));
+        }
+        if matches!(backend, Backend::Internal) && !transitions.is_empty() {
+            return Err(input.error("transitions is only valid with an external backend"));
         }
         Ok(MacroInput {
             peripheral_name: peripheral_name.value(),
+            backend,
             state_definitions: state_definitions.into_iter().collect(),
+            transitions,
         })
     }
 }

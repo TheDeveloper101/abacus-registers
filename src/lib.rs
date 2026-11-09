@@ -4,7 +4,7 @@ use core::convert::TryFrom;
 
 #[doc(hidden)]
 pub use abacus_registers_dsl::__heliod;
-pub use abacus_registers_dsl::{heliod, process_register_block};
+pub use abacus_registers_dsl::{heliod, heliod_operation, process_register_block};
 pub use tock_registers;
 
 /// Trait denoting a register block and specifies

@@ -34,7 +34,7 @@ use syn::{DeriveInput, Field, Type};
 use std::collections::HashSet;
 
 use crate::generating::generate_state_enum;
-use crate::macro_input::MacroInput;
+use crate::macro_input::{Backend, MacroInput};
 use crate::register::Register;
 
 #[proc_macro_attribute]
@@ -49,11 +49,23 @@ fn expand_register_block(
     item: proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let metadata = cost::metadata(attr.clone(), item.clone());
-    let parsed_input: MacroInput = syn::parse2(attr)?;
+    let parsed_input: MacroInput = syn::parse2(attr.clone())?;
     let register = format_ident!("{}Registers", parsed_input.peripheral_name);
     let internal_register = format_ident!("Block");
     let state_enum_ident = format_ident!("{}StateEnum", parsed_input.peripheral_name);
     let inferred_state_ident = format_ident!("{}InferredState", parsed_input.peripheral_name);
+
+    if let Backend::External(backend) = &parsed_input.backend {
+        return expand_external_register_block(
+            attr,
+            item,
+            &parsed_input,
+            backend,
+            &register,
+            &state_enum_ident,
+            &inferred_state_ident,
+        );
+    }
 
     let mut result = add_imports();
     result.extend(generate_register_wrapper(
@@ -95,6 +107,111 @@ fn expand_register_block(
         }
     });
 
+    result.extend(metadata);
+    Ok(result)
+}
+
+fn expand_external_register_block(
+    attr: proc_macro2::TokenStream,
+    item: proc_macro2::TokenStream,
+    input: &MacroInput,
+    backend: &syn::Path,
+    register: &syn::Ident,
+    state_enum: &syn::Ident,
+    inferred_state: &syn::Ident,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let ast: DeriveInput = syn::parse2(item.clone())?;
+    let syn::Data::Struct(data) = &ast.data else {
+        return Err(syn::Error::new_spanned(ast, "expected a model struct"));
+    };
+    if !data.fields.is_empty() {
+        return Err(syn::Error::new_spanned(
+            data.fields.clone(),
+            "an external-backend model must be a unit struct",
+        ));
+    }
+
+    let declared = |state: &parsing::State| {
+        input
+            .state_definitions
+            .iter()
+            .any(|definition| definition.state == *state)
+    };
+    let mut seen = HashSet::new();
+    let mut transition_impls = proc_macro2::TokenStream::new();
+    for transition in &input.transitions {
+        if !declared(&transition.from) || !declared(&transition.to) {
+            return Err(syn::Error::new_spanned(
+                transition.to.form_state_marker_type(),
+                "external transition states must be declared in states",
+            ));
+        }
+        let from = transition.from.form_state_marker_type();
+        let to = transition.to.form_state_marker_type();
+        let target = input
+            .state_definitions
+            .iter()
+            .find(|definition| definition.state == transition.to)
+            .expect("declared transition target");
+        let method = format_ident!("into_{}", target.state_shortname.to_string().to_lowercase());
+        if !seen.insert((from.to_string(), method.to_string())) {
+            return Err(syn::Error::new_spanned(
+                &transition.to.state_name,
+                "duplicate external transition method",
+            ));
+        }
+        transition_impls.extend(quote! {
+            impl #register<#from> {
+                pub(crate) fn #method(self) -> #register<#to> {
+                    #register {
+                        peripheral: self.peripheral,
+                        state: PhantomData,
+                    }
+                }
+            }
+        });
+    }
+
+    let metadata = cost::metadata(attr, item);
+    let mut result = quote! {
+        use abacus_registers::{Reg, State, StateEnum, SubState, SyncState, TransientStateReg};
+        use core::convert::TryFrom;
+        use core::marker::PhantomData;
+
+        #[allow(missing_docs)]
+        pub struct #inferred_state;
+        impl State for #inferred_state {}
+
+        #[allow(missing_docs)]
+        pub struct #register<S: State = #inferred_state> {
+            peripheral: #backend,
+            state: PhantomData<S>,
+        }
+
+        impl<S: State> #register<S> {
+            /// Wrap an externally owned PAC handle in an asserted initial state.
+            ///
+            /// # Safety
+            /// The caller must exclusively own the peripheral and ensure that its
+            /// hardware state is `S`.
+            pub const unsafe fn new(peripheral: #backend) -> Self {
+                Self { peripheral, state: PhantomData }
+            }
+
+            pub(crate) fn peripheral(&self) -> &#backend {
+                &self.peripheral
+            }
+        }
+
+        #transition_impls
+    };
+    result.extend(generate_state_enum(
+        &input.state_definitions,
+        register,
+        state_enum,
+    ));
+    let (states, _) = input.generate_states(register, state_enum)?;
+    result.extend(states);
     result.extend(metadata);
     Ok(result)
 }
@@ -350,6 +467,17 @@ pub fn heliod(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into()
 }
 
+/// Declares the state effect and cost of an opaque peripheral operation.
+///
+/// The surrounding `#[heliod(...)]` analysis consumes this contract while the
+/// Rust compiler receives the function unchanged. This is useful at abstraction
+/// boundaries such as a userspace syscall wrapper, where the checked peripheral
+/// implementation is not in the same crate as the caller.
+#[proc_macro_attribute]
+pub fn heliod_operation(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
 #[doc(hidden)]
 #[proc_macro]
 pub fn __heliod(input: TokenStream) -> TokenStream {
@@ -430,5 +558,53 @@ mod tests {
                     .unwrap_err();
             assert!(error.to_string().contains(message), "{error}");
         }
+    }
+
+    #[test]
+    fn external_backend_wraps_the_pac_without_generating_an_mmio_block() {
+        let expanded = expand_register_block(
+            quote! {
+                peripheral_name = "Temp",
+                backend = external(pac::temp::Temp),
+                states = [(Off, cost: 0), (Reading, *T*, cost: 1)],
+                transitions = [Off => Reading, Reading => Off]
+            },
+            quote! { struct TempModel; },
+        )
+        .unwrap()
+        .to_string();
+
+        assert!(expanded.contains("peripheral : pac :: temp :: Temp"));
+        assert!(expanded.contains("fn into_reading"));
+        assert!(expanded.contains("fn into_off"));
+        assert!(!expanded.contains("AbacusStaticRef"));
+        assert!(!expanded.contains("struct Block"));
+    }
+
+    #[test]
+    fn external_backend_rejects_fields_and_unknown_transition_states() {
+        let attributes = quote! {
+            peripheral_name = "Temp",
+            backend = external(pac::temp::Temp),
+            states = [(Off, cost: 0)],
+            transitions = [Off => Reading]
+        };
+        let error = expand_register_block(attributes, quote! { struct TempModel; }).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("external transition states must be declared"));
+
+        let error = expand_register_block(
+            quote! {
+                peripheral_name = "Temp",
+                backend = external(pac::temp::Temp),
+                states = [(Off, cost: 0)]
+            },
+            quote! { struct TempModel { value: u32 } },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("external-backend model must be a unit struct"));
     }
 }

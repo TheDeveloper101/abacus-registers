@@ -114,3 +114,29 @@ Heliod can infer peripheral states when the generated register type omits its st
 argument. In that form transitions happen in place, so drivers can store the
 register handle directly and do not need `AbacusCell` solely to accommodate a
 changing Rust typestate.
+
+## Wrapping an existing PAC
+
+Drivers that already use a peripheral access crate can select an external backend
+instead of duplicating its MMIO register layout:
+
+```Rust
+#[process_register_block(
+    peripheral_name = "Nrf5xTemp",
+    backend = external(pac::temp::Temp),
+    states = [
+        (Off, cost: temp_off),
+        (Reading, *T*, cost: temp_reading)
+    ],
+    transitions = [Off => Reading, Reading => Off]
+)]
+struct Nrf5xTempModel;
+```
+
+This generates `Nrf5xTempRegisters<S>`, the state types, the state enum, and only
+the declared retyping transitions. `Nrf5xTempRegisters::new` is unsafe because the
+driver must establish exclusive ownership and the asserted initial hardware state.
+The wrapped PAC handle and transition methods are crate-private: the trusted HAL
+implementation can implement the hardware operations, while downstream application
+code cannot bypass its typestate API. HAL operations should use `heliod_operation`
+contracts so their costs and state effects compose into application bounds.

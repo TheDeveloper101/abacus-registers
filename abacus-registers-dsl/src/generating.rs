@@ -125,6 +125,7 @@ pub fn generate_state_enum(
     });
 
     output.extend(quote! {
+        #[allow(missing_docs)]
         pub enum #store_name{
             #(#store_variants),*
         }

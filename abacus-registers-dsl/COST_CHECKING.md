@@ -100,6 +100,85 @@ transition traits and register-access wrapper types are public. Peripheral names
 must be unique within a crate because they name exported metadata macros. Selected
 providers must also have distinct register type names.
 
+## Opaque operation contracts
+
+`#[heliod_operation]` describes a peripheral operation whose implementation is
+outside the checked Rust scope, such as a Tock userspace syscall wrapper. The
+function body is preserved and compiled normally, but Heliod uses the contract
+instead of attempting to inspect that body:
+
+```rust
+#[heliod(TestCost)]
+mod userspace {
+    use abacus_registers::heliod_operation;
+
+    #[heliod_operation(
+        peripheral = TestCost,
+        from = Off,
+        to = Off,
+        cost = temperature_read
+    )]
+    fn read_temperature() -> Result<i32, Error> {
+        platform_temperature_read()
+    }
+
+    fn sample_twice() {
+        let _ = read_temperature();
+        let _ = read_temperature();
+    }
+}
+```
+
+This reports `temperature_read` for `read_temperature` and
+`2 * temperature_read` for `sample_twice`. The provider and both states are
+validated against the selected Abacus model. The cost is an all-inclusive
+operation summary, so Heliod does not add another background charge for the
+summarized peripheral. One implicit peripheral identity is shared by contracts
+using the same provider, including across helper calls and branches.
+
+The `cost` field accepts the same integer or symbolic identifier as the register
+DSL. A symbolic identifier is the name of an externally established summary;
+the current macro does not extract a function summary from a separately compiled
+kernel crate. Crossing that crate boundary therefore requires publishing the
+derived kernel expression under the identifier used by the userspace contract.
+
+Opaque operations may also be async. Heliod supports immediately awaited calls
+to opaque async functions and to checked async helpers:
+
+```rust
+#[heliod_operation(
+    peripheral = Nrf5xTempCost,
+    from = Off,
+    to = Off,
+    cost = 42,
+    background_steps = 10
+)]
+async fn read_temperature(temp: &mut embassy_nrf::temp::Temp<'_>) -> i32 {
+    embassy_time::with_timeout(
+        embassy_time::Duration::from_millis(10),
+        temp.read(),
+    )
+    .await
+    .map(|value| value.to_num())
+    .unwrap_or(i32::MIN)
+}
+
+async fn sample_twice(temp: &mut embassy_nrf::temp::Temp<'_>) {
+    let _first = read_temperature(temp).await;
+    let _second = read_temperature(temp).await;
+}
+```
+
+The manually supplied `cost` is the complete worst-case cost of the summarized
+peripheral itself, including its timeout and recovery. `background_steps` is the
+maximum number of background-charge points inside that operation. At a call site,
+Heliod adds each other live peripheral's background cost that many times; it does
+not add the summarized peripheral again. A stored or unawaited async operation is
+rejected. This deliberately small async fragment does not yet support stored
+futures, async method calls, `join`, `select`, spawning, or arbitrary future
+combinators in checked callers. The opaque operation body remains ordinary Rust
+and may use those implementation details internally; only its contract is checked.
+
 ## Inferred peripheral states
 
 Omit the state type argument to use state inference:

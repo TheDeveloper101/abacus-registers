@@ -3,6 +3,7 @@
 use super::{
     diagnostics::{self, Diagnostic},
     model::Peripheral,
+    operation,
 };
 use crate::parsing::Cost;
 use quote::ToTokens;
@@ -27,6 +28,8 @@ pub(super) struct Device {
     pub(super) model: usize,
     pub(super) states: States,
     input_states: States,
+    implicit: bool,
+    initial_states: States,
 }
 #[derive(Clone, Default)]
 struct Context {
@@ -62,6 +65,7 @@ pub enum ControlFlowSummary {
 pub struct CommandSummary {
     pub foreground: usize,
     pub background: Vec<BackgroundCharge>,
+    pub background_steps: usize,
     pub events: Vec<PeripheralEvent>,
     pub span: proc_macro2::Span,
 }
@@ -94,11 +98,12 @@ impl ControlFlowSummary {
             Self::Empty => 0,
             Self::Command(command) => {
                 command.foreground
-                    + command
-                        .background
-                        .iter()
-                        .map(|charge| charge.cost)
-                        .sum::<usize>()
+                    + command.background_steps
+                        * command
+                            .background
+                            .iter()
+                            .map(|charge| charge.cost)
+                            .sum::<usize>()
             }
             Self::Sequence(parts) => parts.iter().map(Self::cost).sum(),
             Self::Branch(arms) => arms.iter().map(Self::cost).max().unwrap_or(0),
@@ -252,12 +257,17 @@ fn symbolic_cost(
                 .map(|event| event_cost(event, devices, models))
                 .chain(command.background.iter().map(|charge| {
                     let model = &models[devices[charge.device].model];
-                    CostExpression::maximum(
+                    let cost = CostExpression::maximum(
                         charge
                             .states
                             .iter()
                             .map(|state| annotation(&model.states[state].cost)),
-                    )
+                    );
+                    if command.background_steps == 1 {
+                        cost
+                    } else {
+                        CostExpression::Scaled(command.background_steps, Box::new(cost))
+                    }
                 })),
         ),
         ControlFlowSummary::Sequence(parts) => CostExpression::sum(
@@ -342,6 +352,8 @@ struct Checker<'a> {
     summaries: BTreeMap<String, FunctionAnalysis>,
     structs: BTreeMap<String, BTreeMap<String, Type>>,
     inferred: BTreeMap<String, super::inference::Contract>,
+    operations: &'a BTreeMap<String, operation::Contract>,
+    opaque_types: BTreeSet<String>,
 }
 
 #[cfg(test)]
@@ -349,7 +361,16 @@ pub fn check(item: &Item, models: &[Peripheral]) -> Result<Vec<(String, usize)>>
     Ok(analyze(item, models)?.costs)
 }
 
+#[cfg(test)]
 pub fn analyze(item: &Item, models: &[Peripheral]) -> Result<Report> {
+    analyze_with_operations(item, models, &BTreeMap::new())
+}
+
+pub fn analyze_with_operations(
+    item: &Item,
+    models: &[Peripheral],
+    operations: &BTreeMap<String, operation::Contract>,
+) -> Result<Report> {
     let inferred = if has_inferred_types(item, models) {
         super::inference::infer(item, models)?
     } else {
@@ -363,6 +384,11 @@ pub fn analyze(item: &Item, models: &[Peripheral]) -> Result<Report> {
         summaries: BTreeMap::new(),
         structs: BTreeMap::new(),
         inferred,
+        operations,
+        opaque_types: operations
+            .values()
+            .flat_map(|operation| operation.parameter_types.iter().cloned())
+            .collect(),
     };
     checker.collect(item, "")?;
     if checker.functions.is_empty() {
@@ -422,6 +448,9 @@ impl Checker<'_> {
             .ok_or_else(|| failure("unknown function"))?;
         let saved_function = std::mem::replace(&mut self.function, name.to_owned());
         let result = (|| {
+            if let Some(operation) = self.operations.get(name) {
+                return self.summarize_operation(name, &function, operation);
+            }
             let mut context = Context {
                 scope: name
                     .rsplit_once("::")
@@ -462,8 +491,17 @@ impl Checker<'_> {
                 };
                 parameters.push(value);
             }
-            let initial_devices = context.devices.clone();
+            let mut initial_devices = context.devices.clone();
             let evaluation = self.block(&function.body, &mut context)?;
+            initial_devices.extend(context.devices.iter().skip(initial_devices.len()).map(
+                |device| Device {
+                    model: device.model,
+                    states: device.initial_states.clone(),
+                    input_states: device.initial_states.clone(),
+                    implicit: device.implicit,
+                    initial_states: device.initial_states.clone(),
+                },
+            ));
             if !context.tasks.is_empty() {
                 return Err(Error::new(
                     function.body.span(),
@@ -498,6 +536,80 @@ impl Checker<'_> {
         })();
         self.function = saved_function;
         result
+    }
+
+    fn summarize_operation(
+        &mut self,
+        name: &str,
+        function: &Function,
+        operation: &operation::Contract,
+    ) -> Result<()> {
+        let parameters = function
+            .signature
+            .inputs
+            .iter()
+            .map(|argument| match argument {
+                FnArg::Typed(_) => Ok(Value::Scalar),
+                FnArg::Receiver(receiver) => Err(Error::new(
+                    receiver.span(),
+                    "heliod_operation is supported on free functions",
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let source = BTreeSet::from([operation.from.clone()]);
+        let target = BTreeSet::from([operation.to.clone()]);
+        require_uniform_phase(
+            &self.models[operation.model],
+            &source,
+            function.signature.span(),
+        )?;
+        require_uniform_phase(
+            &self.models[operation.model],
+            &target,
+            function.signature.span(),
+        )?;
+        let initial = Device {
+            model: operation.model,
+            states: source.clone(),
+            input_states: source.clone(),
+            implicit: true,
+            initial_states: source.clone(),
+        };
+        let final_device = Device {
+            model: operation.model,
+            states: target.clone(),
+            input_states: States::new(),
+            implicit: true,
+            initial_states: source.clone(),
+        };
+        let cost = operation.cost.concrete().unwrap_or(0);
+        let summary = ControlFlowSummary::Command(CommandSummary {
+            foreground: cost,
+            background: Vec::new(),
+            background_steps: operation.background_steps,
+            events: vec![PeripheralEvent {
+                device: 0,
+                operation: operation.operation.clone(),
+                source,
+                target,
+                transition: false,
+                cost,
+                source_inputs: BTreeSet::from([operation.from.clone()]),
+                span: function.signature.span(),
+            }],
+            span: function.signature.span(),
+        });
+        self.summaries.insert(
+            name.to_owned(),
+            FunctionAnalysis {
+                parameters,
+                initial_devices: vec![initial],
+                final_devices: vec![final_device],
+                result: Value::Scalar,
+                summary,
+            },
+        );
+        Ok(())
     }
 
     fn collect(&mut self, item: &Item, scope: &str) -> Result<()> {
@@ -556,13 +668,10 @@ impl Checker<'_> {
         body: &Block,
         owner: Option<String>,
     ) -> Result<()> {
-        if signature.asyncness.is_some()
-            || signature.unsafety.is_some()
-            || !signature.generics.params.is_empty()
-        {
+        if signature.unsafety.is_some() || !signature.generics.params.is_empty() {
             return Err(Error::new(
                 signature.span(),
-                "async, unsafe, and generic functionsare not supported yet",
+                "unsafe and generic functions are not supported yet",
             ));
         }
         let name = qualify(scope, &signature.ident.to_string());
@@ -590,6 +699,9 @@ impl Checker<'_> {
             ));
         }
         let name = type_name(ty)?;
+        if self.opaque_types.contains(&name) {
+            return Ok(Value::Scalar);
+        }
         if matches!(
             name.as_str(),
             "bool"
@@ -652,7 +764,9 @@ impl Checker<'_> {
             context.devices.push(Device {
                 model: index,
                 input_states: states.clone(),
+                initial_states: states.clone(),
                 states,
+                implicit: false,
             });
             return Ok(Value::Register(id));
         }
@@ -804,6 +918,7 @@ impl Checker<'_> {
                 statement_parts.push(ControlFlowSummary::Command(CommandSummary {
                     foreground,
                     background,
+                    background_steps: 1,
                     events: next.events,
                     span: statement.span(),
                 }));
@@ -811,6 +926,7 @@ impl Checker<'_> {
                 statement_parts.push(ControlFlowSummary::Command(CommandSummary {
                     foreground,
                     background: Vec::new(),
+                    background_steps: 1,
                     events: next.events,
                     span: statement.span(),
                 }));
@@ -844,6 +960,7 @@ impl Checker<'_> {
             parts.push(ControlFlowSummary::Command(CommandSummary {
                 foreground,
                 background,
+                background_steps: 1,
                 events: std::mem::take(&mut result.events),
                 span: expr.span(),
             }));
@@ -851,6 +968,7 @@ impl Checker<'_> {
             parts.push(ControlFlowSummary::Command(CommandSummary {
                 foreground,
                 background: Vec::new(),
+                background_steps: 1,
                 events: std::mem::take(&mut result.events),
                 span: expr.span(),
             }));
@@ -965,62 +1083,84 @@ impl Checker<'_> {
             }
             Expr::Match(branch) => self.match_states(branch, context),
             Expr::MethodCall(call) => self.method(call, context),
-            Expr::Call(call) => {
-                let Expr::Path(path) = call.func.as_ref() else {
+            Expr::Call(call) => self.call_expression(call, context, false),
+            Expr::Await(awaited) => {
+                let Expr::Call(call) = awaited.base.as_ref() else {
                     return Err(Error::new(
-                        expr.span(),
-                        "indirect calls have no cost summary",
+                        awaited.span(),
+                        "Heliod supports immediately awaited function calls",
                     ));
                 };
-                let name = path
-                    .path
-                    .segments
-                    .last()
-                    .ok_or_else(|| Error::new_spanned(&path.path, "expected a nonempty path"))?
-                    .ident
-                    .to_string();
-                if name == "heliod_async" {
-                    return self.async_spawn(call, context);
-                }
-                if name == "heliod_await" {
-                    return self.await_timeout(call, context);
-                }
-                let mut values = Vec::new();
-                let mut cost = 0;
-                let mut summaries = Vec::new();
-                let mut events = Vec::new();
-                for argument in &call.args {
-                    let value = self.expression(argument, context)?;
-                    cost += value.cost;
-                    summaries.push(value.summary);
-                    events.extend(value.events);
-                    values.push(value.value);
-                }
-                if matches!(name.as_str(), "Ok" | "Err" | "Some") {
-                    let mut result = Evaluation::new(Value::Scalar, cost);
-                    result.summary = sequence(summaries);
-                    result.events = events;
-                    return Ok(result);
-                }
-                let key = path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::");
-                let mut result = self.call(&key, values, context, call.span())?;
-                result.cost += cost;
-                result.summary = sequence([sequence(summaries), result.summary]);
-                result.events.extend(events);
-                result.call_body_charged = true;
-                Ok(result)
+                self.call_expression(call, context, true)
             }
             _ => Err(Error::new(
                 expr.span(),
                 "unsupported expression; no cost bound can be reported",
             )),
         }
+    }
+
+    fn call_expression(
+        &mut self,
+        call: &syn::ExprCall,
+        context: &mut Context,
+        awaiting: bool,
+    ) -> Result<Evaluation> {
+        let Expr::Path(path) = call.func.as_ref() else {
+            return Err(Error::new(
+                call.span(),
+                "indirect calls have no cost summary",
+            ));
+        };
+        let name = path
+            .path
+            .segments
+            .last()
+            .ok_or_else(|| Error::new_spanned(&path.path, "expected a nonempty path"))?
+            .ident
+            .to_string();
+        if name == "heliod_async" {
+            return self.async_spawn(call, context);
+        }
+        if name == "heliod_await" {
+            return self.await_timeout(call, context);
+        }
+        let mut values = Vec::new();
+        let mut cost = 0;
+        let mut summaries = Vec::new();
+        let mut events = Vec::new();
+        for argument in &call.args {
+            let value = self.expression(argument, context)?;
+            cost += value.cost;
+            summaries.push(value.summary);
+            events.extend(value.events);
+            values.push(value.value);
+        }
+        if matches!(name.as_str(), "Ok" | "Err" | "Some") {
+            if awaiting {
+                return Err(Error::new(
+                    call.span(),
+                    "cannot await a synchronous constructor",
+                ));
+            }
+            let mut result = Evaluation::new(Value::Scalar, cost);
+            result.summary = sequence(summaries);
+            result.events = events;
+            return Ok(result);
+        }
+        let key = path
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        let mut result = self.call(&key, values, context, call.span(), awaiting)?;
+        result.cost += cost;
+        result.summary = sequence([sequence(summaries), result.summary]);
+        result.events.extend(events);
+        result.call_body_charged = true;
+        Ok(result)
     }
 
     fn async_spawn(&mut self, call: &syn::ExprCall, context: &mut Context) -> Result<Evaluation> {
@@ -1185,6 +1325,7 @@ impl Checker<'_> {
         let timeout_tick = ControlFlowSummary::Command(CommandSummary {
             foreground: 0,
             background: timeout_background,
+            background_steps: 1,
             events: Vec::new(),
             span: call.args[1].span(),
         });
@@ -1341,7 +1482,8 @@ impl Checker<'_> {
                 summaries.push(value.summary);
                 events.extend(value.events);
             }
-            let mut result = self.call(&qualify(&owner, &name), values, context, call.span())?;
+            let mut result =
+                self.call(&qualify(&owner, &name), values, context, call.span(), false)?;
             result.cost += cost;
             result.summary = sequence([sequence(summaries), result.summary]);
             result.events.extend(events);
@@ -1535,6 +1677,7 @@ impl Checker<'_> {
         values: Vec<Value>,
         context: &mut Context,
         span: proc_macro2::Span,
+        awaiting: bool,
     ) -> Result<Evaluation> {
         let scope = context.scope.as_str();
         let name = if let Some(method) = requested.strip_prefix("Self::") {
@@ -1555,6 +1698,14 @@ impl Checker<'_> {
         let function = self.functions.get(&name).cloned().ok_or_else(|| {
             failure("unknown callee; include its body in the same checked module or impl")
         })?;
+        if function.signature.asyncness.is_some() != awaiting {
+            let message = if awaiting {
+                "cannot await a synchronous function"
+            } else {
+                "async Heliod functions must be awaited immediately"
+            };
+            return Err(Error::new(span, message));
+        }
         if function.signature.inputs.len() != values.len() {
             return Err(failure("helper argument count mismatch"));
         }
@@ -1573,6 +1724,21 @@ impl Checker<'_> {
         let mut devices = vec![None; function.initial_devices.len()];
         for (parameter, argument) in function.parameters.iter().zip(&arguments) {
             map_argument(parameter, argument, &mut devices, span)?;
+        }
+        for (id, formal) in function.initial_devices.iter().enumerate() {
+            if !formal.implicit || devices[id].is_some() {
+                continue;
+            }
+            let actual = context
+                .devices
+                .iter()
+                .position(|device| device.implicit && device.model == formal.model)
+                .unwrap_or_else(|| {
+                    let actual = context.devices.len();
+                    context.devices.push(formal.clone());
+                    actual
+                });
+            devices[id] = Some(actual);
         }
         let mapped = devices
             .into_iter()
@@ -1729,6 +1895,7 @@ impl Checker<'_> {
                 ControlFlowSummary::Command(CommandSummary {
                     foreground: events.iter().map(|event| event.cost).sum(),
                     background,
+                    background_steps: command.background_steps,
                     events,
                     span: command.span,
                 })
@@ -1951,6 +2118,13 @@ fn bind(pattern: &Pat, value: Value, context: &mut Context) -> Result<()> {
     }
 }
 fn join_context(left: &Context, right: &Context) -> Result<Context> {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    if left.devices.len() < right.devices.len() {
+        extend_missing_implicit_devices(&mut left, &right)?;
+    } else if right.devices.len() < left.devices.len() {
+        extend_missing_implicit_devices(&mut right, &left)?;
+    }
     if left.devices.len() != right.devices.len() {
         return Err(failure("branches change peripheral identities"));
     }
@@ -1961,6 +2135,9 @@ fn join_context(left: &Context, right: &Context) -> Result<Context> {
     }
     let mut joined = left.clone();
     for (device, other) in joined.devices.iter_mut().zip(&right.devices) {
+        if device.model != other.model || device.implicit != other.implicit {
+            return Err(failure("branches change peripheral identities"));
+        }
         device.states.extend(other.states.iter().cloned());
         device
             .input_states
@@ -1985,6 +2162,19 @@ fn join_context(left: &Context, right: &Context) -> Result<Context> {
     }
     joined.next_task = left.next_task.max(right.next_task);
     Ok(joined)
+}
+
+fn extend_missing_implicit_devices(shorter: &mut Context, longer: &Context) -> Result<()> {
+    for device in longer.devices.iter().skip(shorter.devices.len()) {
+        if !device.implicit {
+            return Err(failure("branches change peripheral identities"));
+        }
+        let mut initial = device.clone();
+        initial.states = initial.initial_states.clone();
+        initial.input_states = initial.initial_states.clone();
+        shorter.devices.push(initial);
+    }
+    Ok(())
 }
 fn join_result(left: Evaluation, right: Evaluation) -> Result<Evaluation> {
     if left.returned != right.returned {

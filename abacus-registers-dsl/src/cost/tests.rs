@@ -1,4 +1,4 @@
-use super::{checking, model::Peripheral};
+use super::{checking, model::Peripheral, operation};
 use crate::{
     macro_input::MacroInput,
     parsing::{RegisterAttributes, StateDefinition},
@@ -922,4 +922,162 @@ fn symbolic_async_timeout_is_reported_as_a_scaled_state_cost() {
     assert!(cost.contains("3 * (reading_cost)"), "{cost}");
     assert!(cost.contains("off_cost -> reading_cost"), "{cost}");
     assert!(cost.contains("reading_cost -> off_cost"), "{cost}");
+}
+
+#[test]
+fn opaque_operations_compose_derived_costs_across_calls() {
+    let item = syn::parse_str(
+        r#"mod api {
+            #[heliod_operation(
+                peripheral = TestCost,
+                from = Off,
+                to = Off,
+                cost = temperature_read
+            )]
+            fn read_temperature() -> Result<i32, Error> {
+                Temperature::<TockSyscalls>::read()
+            }
+
+            fn sample_twice() {
+                read_temperature();
+                read_temperature();
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut models = vec![model(STATES, REGISTERS).unwrap()];
+    let operations = operation::collect(&item, &models).unwrap();
+    operation::install(&operations, &mut models).unwrap();
+    let report = checking::analyze_with_operations(&item, &models, &operations).unwrap();
+    assert!(report
+        .reported_costs
+        .contains(&("api::read_temperature".into(), "temperature_read".into())));
+    assert!(report
+        .reported_costs
+        .contains(&("api::sample_twice".into(), "2 * temperature_read".into())));
+}
+
+#[test]
+fn opaque_operation_identity_is_preserved_across_branches() {
+    let item = syn::parse_str(
+        r#"mod api {
+            #[heliod_operation(peripheral=TestCost,from=Off,to=Off,cost=read)]
+            fn read_temperature() { external_call(); }
+            fn maybe_read(enabled: bool) {
+                if enabled { read_temperature(); }
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut models = vec![model(STATES, REGISTERS).unwrap()];
+    let operations = operation::collect(&item, &models).unwrap();
+    operation::install(&operations, &mut models).unwrap();
+    let report = checking::analyze_with_operations(&item, &models, &operations).unwrap();
+    assert!(report
+        .reported_costs
+        .contains(&("api::maybe_read".into(), "max(0, read)".into())));
+}
+
+#[test]
+fn opaque_async_operations_charge_ambient_background_for_every_step() {
+    let item = syn::parse_str(
+        r#"mod api {
+            use external::Temp;
+            #[heliod_operation(
+                peripheral=TestCost,
+                from=Off,
+                to=Off,
+                cost=42,
+                background_steps=10
+            )]
+            async fn read_temperature(temp: &mut Temp) -> i32 {
+                external_read(temp).await
+            }
+            async fn sample(temp: &mut Temp, radio: &TestRegisters<On>) {
+                let _reading = read_temperature(temp).await;
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut models = vec![model(STATES, REGISTERS).unwrap()];
+    let operations = operation::collect(&item, &models).unwrap();
+    operation::install(&operations, &mut models).unwrap();
+    let report = checking::analyze_with_operations(&item, &models, &operations).unwrap();
+    assert!(report.costs.contains(&("api::read_temperature".into(), 42)));
+    // The opaque cost includes the temperature peripheral. The other live
+    // peripheral remains On for all ten summarized background steps.
+    assert!(report.costs.contains(&("api::sample".into(), 42 + 10 * 5)));
+}
+
+#[test]
+fn opaque_async_operations_must_be_awaited_immediately() {
+    let item = syn::parse_str(
+        r#"mod api {
+            use external::Temp;
+            #[heliod_operation(peripheral=TestCost,from=Off,to=Off,cost=42)]
+            async fn read_temperature(temp: &mut Temp) -> i32 {
+                external_read(temp).await
+            }
+            async fn sample(temp: &mut Temp) {
+                let _future = read_temperature(temp);
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut models = vec![model(STATES, REGISTERS).unwrap()];
+    let operations = operation::collect(&item, &models).unwrap();
+    operation::install(&operations, &mut models).unwrap();
+    let error = match checking::analyze_with_operations(&item, &models, &operations) {
+        Ok(_) => panic!("unawaited async operation was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("awaited immediately"), "{error}");
+}
+
+#[test]
+fn opaque_operations_validate_the_provider_and_states() {
+    for (attribute, message) in [
+        (
+            "peripheral=OtherCost,from=Off,to=Off,cost=read",
+            "not a selected cost provider",
+        ),
+        (
+            "peripheral=TestCost,from=Missing,to=Off,cost=read",
+            "unknown source state",
+        ),
+        (
+            "peripheral=TestCost,from=Off,to=Missing,cost=read",
+            "unknown target state",
+        ),
+    ] {
+        let item = syn::parse_str(&format!(
+            "#[heliod_operation({attribute})] fn read() {{ external_call(); }}"
+        ))
+        .unwrap();
+        let error = operation::collect(&item, &[model(STATES, REGISTERS).unwrap()]).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+}
+
+#[test]
+fn opaque_internal_operations_may_cross_stable_and_transient_phases() {
+    let item = syn::parse_str(
+        r#"mod api {
+            #[heliod_operation(peripheral=TestCost,from=Off,to=Reading,cost=start)]
+            fn start() { pac_start(); }
+            #[heliod_operation(peripheral=TestCost,from=Reading,to=Off,cost=complete)]
+            fn complete() { pac_complete(); }
+        }"#,
+    )
+    .unwrap();
+    let mut models = vec![async_model("(Off,cost:off),(Reading,*T*,cost:reading)")];
+    let operations = operation::collect(&item, &models).unwrap();
+    operation::install(&operations, &mut models).unwrap();
+    let report = checking::analyze_with_operations(&item, &models, &operations).unwrap();
+    assert!(report
+        .reported_costs
+        .contains(&("api::start".into(), "start".into())));
+    assert!(report
+        .reported_costs
+        .contains(&("api::complete".into(), "complete".into())));
 }

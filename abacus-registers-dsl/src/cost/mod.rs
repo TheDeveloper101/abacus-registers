@@ -4,6 +4,7 @@ mod checking;
 mod diagnostics;
 mod inference;
 mod model;
+mod operation;
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -106,8 +107,10 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         let remaining = providers.iter().skip(1);
         return Ok(quote! { #provider! { [#models] [#(#remaining),*] {#item} } });
     }
-    let Specifications(models) = syn::parse2(models)?;
-    let report = checking::analyze(&item, &models)?;
+    let Specifications(mut models) = syn::parse2(models)?;
+    let operations = operation::collect(&item, &models)?;
+    operation::install(&operations, &mut models)?;
+    let report = checking::analyze_with_operations(&item, &models, &operations)?;
     for (name, cost) in report.reported_costs {
         eprintln!("Heliod cost for {name}: {cost}");
     }
