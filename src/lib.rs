@@ -5,6 +5,22 @@ use core::convert::TryFrom;
 #[doc(hidden)]
 pub use abacus_registers_dsl::__heliod;
 pub use abacus_registers_dsl::{heliod, heliod_operation, process_register_block};
+
+/// Runs a block a fixed number of times and supplies that bound to Heliod.
+#[macro_export]
+macro_rules! heliod_loop {
+    ($bound:literal, $body:block) => {{
+        for _heliod_iteration in 0..$bound $body
+    }};
+}
+
+/// Executes an expression normally while excluding it from Heliod's selected cost model.
+#[macro_export]
+macro_rules! heliod_ignore {
+    ($expression:expr) => {{
+        $expression
+    }};
+}
 pub use tock_registers;
 
 /// Trait denoting a register block and specifies
