@@ -5,7 +5,7 @@
 //! current state, branch requirements are conjoined and branch results are joined,
 //! and calls apply the inferred input/output sets of the callee.
 
-use super::model::Peripheral;
+use super::{model::Peripheral, operation};
 use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
 use syn::{
@@ -20,6 +20,7 @@ enum Value {
     Scalar,
     Register(usize),
     Task(usize),
+    Guard(usize),
     Tuple(Vec<Value>),
     Object(String, BTreeMap<String, Value>),
 }
@@ -46,6 +47,13 @@ struct Context {
     captured: BTreeSet<usize>,
     tasks: BTreeMap<usize, InferenceTask>,
     next_task: usize,
+    guards: BTreeMap<usize, InferenceGuard>,
+    next_guard: usize,
+}
+
+#[derive(Clone)]
+struct InferenceGuard {
+    devices: BTreeMap<usize, States>,
 }
 
 #[derive(Clone)]
@@ -70,13 +78,18 @@ pub(super) struct Contract {
     result: Value,
 }
 
-pub(super) fn infer(item: &Item, models: &[Peripheral]) -> Result<BTreeMap<String, Contract>> {
+pub(super) fn infer(
+    item: &Item,
+    models: &[Peripheral],
+    operations: &BTreeMap<String, operation::Contract>,
+) -> Result<BTreeMap<String, Contract>> {
     let mut checker = Checker {
         models,
         functions: BTreeMap::new(),
         contracts: BTreeMap::new(),
         structs: BTreeMap::new(),
         active: BTreeSet::new(),
+        operations,
     };
     checker.collect(item, "")?;
     let names = checker.functions.keys().cloned().collect::<Vec<_>>();
@@ -92,6 +105,7 @@ struct Checker<'a> {
     contracts: BTreeMap<String, Contract>,
     structs: BTreeMap<String, BTreeMap<String, Type>>,
     active: BTreeSet<String>,
+    operations: &'a BTreeMap<String, operation::Contract>,
 }
 
 impl Checker<'_> {
@@ -172,6 +186,36 @@ impl Checker<'_> {
             .get(name)
             .cloned()
             .ok_or_else(|| failure("unknown function"))?;
+        if let Some(operation) = self.operations.get(name) {
+            let parameters = function
+                .signature
+                .inputs
+                .iter()
+                .map(|argument| match argument {
+                    FnArg::Typed(argument)
+                        if type_name(&argument.ty)? == self.models[operation.model].registers =>
+                    {
+                        Ok(Value::Register(0))
+                    }
+                    FnArg::Typed(_) => Ok(Value::Scalar),
+                    FnArg::Receiver(receiver) => Err(Error::new(
+                        receiver.span(),
+                        "heliod_operation is supported on free functions",
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.contracts.insert(
+                name.to_owned(),
+                Contract {
+                    parameters,
+                    inputs: vec![(operation.model, States::from([operation.from.clone()]))],
+                    outputs: vec![(operation.model, States::from([operation.to.clone()]))],
+                    result: Value::Scalar,
+                },
+            );
+            self.active.remove(name);
+            return Ok(());
+        }
         let result = (|| {
             let mut context = Context {
                 scope: name
@@ -209,6 +253,12 @@ impl Checker<'_> {
                 parameters.push(value);
             }
             let value = self.block(&function.body, &mut context)?;
+            if !context.guards.is_empty() {
+                return Err(Error::new(
+                    function.body.span(),
+                    "every OnDrop fallback must be defused on the normal path",
+                ));
+            }
             if !context.tasks.is_empty() {
                 return Err(Error::new(
                     function.body.span(),
@@ -374,45 +424,167 @@ impl Checker<'_> {
                 Ok(left_value)
             }
             Expr::MethodCall(call) => self.method(call, context),
-            Expr::Call(call) => {
-                let Expr::Path(path) = call.func.as_ref() else {
-                    return Err(Error::new(call.span(), "indirect calls are unsupported"));
+            Expr::Await(awaited) => {
+                let Expr::Call(call) = awaited.base.as_ref() else {
+                    return Err(Error::new(
+                        awaited.span(),
+                        "state inference supports immediately awaited calls",
+                    ));
                 };
-                let name = path
-                    .path
-                    .segments
-                    .last()
-                    .ok_or_else(|| Error::new(path.span(), "expected function name"))?
-                    .ident
-                    .to_string();
-                if name == "heliod_async" {
-                    return self.async_spawn(call, context);
+                if inference_call_name(call).as_deref() == Some("with_timeout") {
+                    self.embassy_timeout(call, context)
+                } else {
+                    self.function_call(call, context)
                 }
-                if name == "heliod_await" {
-                    return self.await_timeout(call, context);
-                }
-                let values = call
-                    .args
-                    .iter()
-                    .map(|argument| self.expression(argument, context))
-                    .collect::<Result<Vec<_>>>()?;
-                if matches!(name.as_str(), "Ok" | "Err" | "Some") {
-                    return Ok(Value::Scalar);
-                }
-                let requested = path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|segment| segment.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::");
-                self.call(&requested, values, context, call.span())
             }
+            Expr::Call(call) => self.function_call(call, context),
             _ => Err(Error::new(
                 expression.span(),
                 "unsupported expression in state inference",
             )),
         }
+    }
+
+    fn function_call(&mut self, call: &syn::ExprCall, context: &mut Context) -> Result<Value> {
+        let Expr::Path(path) = call.func.as_ref() else {
+            return Err(Error::new(call.span(), "indirect calls are unsupported"));
+        };
+        let name = path
+            .path
+            .segments
+            .last()
+            .ok_or_else(|| Error::new(path.span(), "expected function name"))?
+            .ident
+            .to_string();
+        if name == "new"
+            && path
+                .path
+                .segments
+                .iter()
+                .rev()
+                .nth(1)
+                .is_some_and(|segment| segment.ident == "OnDrop")
+        {
+            return self.on_drop(call, context);
+        }
+        if name == "heliod_async" {
+            return self.async_spawn(call, context);
+        }
+        if name == "heliod_await" {
+            return self.await_timeout(call, context);
+        }
+        let values = call
+            .args
+            .iter()
+            .map(|argument| self.expression(argument, context))
+            .collect::<Result<Vec<_>>>()?;
+        if matches!(name.as_str(), "Ok" | "Err" | "Some") {
+            return Ok(Value::Scalar);
+        }
+        let requested = path
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        self.call(&requested, values, context, call.span())
+    }
+
+    fn on_drop(&mut self, call: &syn::ExprCall, context: &mut Context) -> Result<Value> {
+        let Some(Expr::Closure(closure)) = call.args.first() else {
+            return Err(Error::new(
+                call.span(),
+                "OnDrop::new expects an inline closure",
+            ));
+        };
+        if !closure.inputs.is_empty() {
+            return Err(Error::new(
+                closure.span(),
+                "OnDrop fallback takes no arguments",
+            ));
+        }
+        let before = context.clone();
+        let mut fallback = context.clone();
+        self.expression(&closure.body, &mut fallback)?;
+        let mut devices = BTreeMap::new();
+        for (id, (source, target)) in before.devices.iter().zip(&fallback.devices).enumerate() {
+            let source_states = possible(&source.state, &before.inputs);
+            let target_states = possible(&target.state, &fallback.inputs);
+            if source_states != target_states {
+                require_phase(
+                    &self.models[source.model],
+                    &source_states,
+                    true,
+                    closure.span(),
+                )?;
+                require_phase(
+                    &self.models[target.model],
+                    &target_states,
+                    false,
+                    closure.span(),
+                )?;
+                devices.insert(id, target_states);
+            }
+        }
+        if devices.is_empty() {
+            return Err(Error::new(
+                closure.span(),
+                "OnDrop fallback must restore a transient peripheral",
+            ));
+        }
+        let guard = context.next_guard;
+        context.next_guard += 1;
+        context.guards.insert(guard, InferenceGuard { devices });
+        Ok(Value::Guard(guard))
+    }
+
+    fn embassy_timeout(&mut self, call: &syn::ExprCall, context: &mut Context) -> Result<Value> {
+        if call.args.len() != 2 {
+            return Err(Error::new(
+                call.span(),
+                "with_timeout expects two arguments",
+            ));
+        }
+        inference_duration_ticks(&call.args[0])?;
+        let Expr::Call(future) = &call.args[1] else {
+            return Err(Error::new(
+                call.args[1].span(),
+                "with_timeout needs an immediately called async function",
+            ));
+        };
+        let guarded = context
+            .guards
+            .values()
+            .flat_map(|guard| guard.devices.keys().copied())
+            .collect::<BTreeSet<_>>();
+        for (id, device) in context.devices.iter().enumerate() {
+            let states = possible(&device.state, &context.inputs);
+            if states
+                .iter()
+                .any(|state| self.models[device.model].states[state].transient)
+                && !guarded.contains(&id)
+            {
+                return Err(Error::new(
+                    call.span(),
+                    "transient peripheral needs an active OnDrop fallback",
+                ));
+            }
+        }
+        let value = self.function_call(future, context)?;
+        for device in &context.devices {
+            let states = possible(&device.state, &context.inputs);
+            require_phase(&self.models[device.model], &states, false, call.span())?;
+        }
+        for guard in context.guards.values() {
+            for (device, states) in &guard.devices {
+                context.devices[*device].state = StateExpression::Union(vec![
+                    context.devices[*device].state.clone(),
+                    StateExpression::Known(states.clone()),
+                ]);
+            }
+        }
+        Ok(value)
     }
 
     fn async_spawn(&mut self, call: &syn::ExprCall, context: &mut Context) -> Result<Value> {
@@ -534,6 +706,37 @@ impl Checker<'_> {
 
     fn method(&mut self, call: &syn::ExprMethodCall, context: &mut Context) -> Result<Value> {
         let name = call.method.to_string();
+        if matches!(name.as_str(), "unwrap" | "expect") {
+            let value = self.expression(&call.receiver, context)?;
+            if value != Value::Scalar {
+                return Err(Error::new(
+                    call.receiver.span(),
+                    "unwrap expects a scalar result",
+                ));
+            }
+            for argument in &call.args {
+                self.expression(argument, context)?;
+            }
+            return Ok(Value::Scalar);
+        }
+        if name == "defuse" && call.args.is_empty() {
+            let Value::Guard(guard) = lookup(&call.receiver, context)? else {
+                return Err(Error::new(
+                    call.receiver.span(),
+                    "defuse expects an OnDrop guard",
+                ));
+            };
+            let guard = context
+                .guards
+                .remove(&guard)
+                .ok_or_else(|| Error::new(call.span(), "OnDrop guard was already defused"))?;
+            for device in guard.devices.keys() {
+                let current = &context.devices[*device];
+                let states = possible(&current.state, &context.inputs);
+                require_phase(&self.models[current.model], &states, false, call.span())?;
+            }
+            return Ok(Value::Scalar);
+        }
         if name == "into" && call.args.is_empty() {
             return self.expression(&call.receiver, context);
         }
@@ -714,6 +917,7 @@ fn join(left: Context, right: Context) -> Result<Context> {
     }
     if left.captured != right.captured
         || left.tasks.keys().collect::<Vec<_>>() != right.tasks.keys().collect::<Vec<_>>()
+        || left.guards.keys().collect::<Vec<_>>() != right.guards.keys().collect::<Vec<_>>()
     {
         return Err(failure("branches must leave the same async tasks pending"));
     }
@@ -811,6 +1015,10 @@ fn map_argument(
             span,
             "Heliod tasks cannot cross function boundaries",
         )),
+        (Value::Guard(_), _) | (_, Value::Guard(_)) => Err(Error::new(
+            span,
+            "OnDrop guards cannot cross function boundaries",
+        )),
         (Value::Register(formal), Value::Register(actual)) => {
             match devices[*formal] {
                 Some(existing) if existing != *actual => {
@@ -850,6 +1058,12 @@ fn map_result(value: &Value, devices: &[usize], span: proc_macro2::Span) -> Resu
             return Err(Error::new(
                 span,
                 "Heliod tasks cannot cross function boundaries",
+            ))
+        }
+        Value::Guard(_) => {
+            return Err(Error::new(
+                span,
+                "OnDrop guards cannot cross function boundaries",
             ))
         }
         Value::Tuple(values) => Value::Tuple(
@@ -956,6 +1170,38 @@ fn integer_literal(expression: &Expr) -> Result<usize> {
     integer.base10_parse()
 }
 
+fn inference_call_name(call: &syn::ExprCall) -> Option<String> {
+    let Expr::Path(path) = call.func.as_ref() else {
+        return None;
+    };
+    path.path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+}
+
+fn inference_duration_ticks(expression: &Expr) -> Result<usize> {
+    let Expr::Call(call) = expression else {
+        return Err(Error::new(
+            expression.span(),
+            "timeout must use Duration::from_ticks with a literal",
+        ));
+    };
+    let Expr::Path(path) = call.func.as_ref() else {
+        return Err(Error::new(call.span(), "expected Duration::from_ticks"));
+    };
+    if path
+        .path
+        .segments
+        .last()
+        .is_none_or(|segment| segment.ident != "from_ticks")
+        || call.args.len() != 1
+    {
+        return Err(Error::new(call.span(), "expected Duration::from_ticks(N)"));
+    }
+    integer_literal(&call.args[0])
+}
+
 fn resolve(scope: &str, requested: &str, functions: &BTreeMap<String, Function>) -> String {
     if let Some(method) = requested.strip_prefix("Self::") {
         return qualify(scope, method);
@@ -974,6 +1220,9 @@ fn resolve(scope: &str, requested: &str, functions: &BTreeMap<String, Function>)
 }
 
 fn type_name(ty: &Type) -> Result<String> {
+    if let Type::Reference(reference) = ty {
+        return type_name(&reference.elem);
+    }
     let Type::Path(path) = ty else {
         return Err(Error::new(ty.span(), "unsupported type"));
     };

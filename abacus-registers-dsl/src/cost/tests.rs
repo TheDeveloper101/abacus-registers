@@ -1081,3 +1081,112 @@ fn opaque_internal_operations_may_cross_stable_and_transient_phases() {
         .reported_costs
         .contains(&("api::complete".into(), "complete".into())));
 }
+
+#[test]
+fn opaque_operations_preserve_an_inferred_register_argument() {
+    let item = syn::parse_str(
+        r#"mod api {
+            #[heliod_operation(peripheral=TestCost,from=Off,to=On,cost=2)]
+            fn start(registers: &TestRegisters) { external_start(registers); }
+            #[heliod_operation(peripheral=TestCost,from=On,to=Off,cost=2)]
+            fn stop(registers: &TestRegisters) { external_stop(registers); }
+            fn cycle(registers: &TestRegisters) {
+                start(registers);
+                stop(registers);
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut models = vec![model(STATES, REGISTERS).unwrap()];
+    let operations = operation::collect(&item, &models).unwrap();
+    operation::install(&operations, &mut models).unwrap();
+    let report = checking::analyze_with_operations(&item, &models, &operations).unwrap();
+    assert!(report.costs.contains(&("api::cycle".into(), 4)));
+}
+
+#[test]
+fn opaque_operations_reject_an_invalid_inferred_sequence() {
+    let item = syn::parse_str(
+        r#"mod api {
+            #[heliod_operation(peripheral=TestCost,from=Off,to=On,cost=2)]
+            fn start(registers: &TestRegisters) { external_start(registers); }
+            fn invalid(registers: &TestRegisters) {
+                start(registers);
+                start(registers);
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut models = vec![model(STATES, REGISTERS).unwrap()];
+    let operations = operation::collect(&item, &models).unwrap();
+    operation::install(&operations, &mut models).unwrap();
+    let error = match checking::analyze_with_operations(&item, &models, &operations) {
+        Ok(_) => panic!("invalid inferred operation sequence was accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("unavailable") || error.to_string().contains("unsatisfiable"),
+        "{error}"
+    );
+}
+
+#[test]
+fn embassy_timeout_uses_on_drop_as_the_stable_fallback() {
+    let item = syn::parse_str(
+        r#"mod api {
+            #[heliod_operation(peripheral=TestCost,from=Off,to=Reading,cost=2)]
+            fn start(p: &TestRegisters) {}
+            #[heliod_operation(peripheral=TestCost,from=Reading,to=Reading,cost=1)]
+            async fn wait_ready(p: &TestRegisters) {}
+            #[heliod_operation(peripheral=TestCost,from=Reading,to=Off,cost=2)]
+            fn complete(p: &TestRegisters) {}
+            #[heliod_operation(peripheral=TestCost,from=Reading,to=Off,cost=2)]
+            fn cancel(p: &TestRegisters) {}
+            async fn finish(p: &TestRegisters) {
+                wait_ready(p).await;
+                complete(p);
+            }
+            async fn read(p: &TestRegisters) {
+                start(p);
+                let guard = OnDrop::new(|| cancel(p));
+                with_timeout(Duration::from_ticks(3), finish(p)).await;
+                guard.defuse();
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut models = vec![async_model("(Off,cost:1),(Reading,*T*,cost:5)")];
+    let operations = operation::collect(&item, &models).unwrap();
+    operation::install(&operations, &mut models).unwrap();
+    let report = checking::analyze_with_operations(&item, &models, &operations).unwrap();
+    assert!(report
+        .costs
+        .iter()
+        .any(|(name, cost)| name == "api::read" && *cost > 0));
+}
+
+#[test]
+fn embassy_timeout_rejects_a_fallback_that_remains_transient() {
+    let item = syn::parse_str(
+        r#"mod api {
+            #[heliod_operation(peripheral=TestCost,from=Off,to=Reading,cost=2)]
+            fn start(p: &TestRegisters) {}
+            #[heliod_operation(peripheral=TestCost,from=Reading,to=Reading,cost=1)]
+            fn keep_reading(p: &TestRegisters) {}
+            async fn invalid(p: &TestRegisters) {
+                start(p);
+                let guard = OnDrop::new(|| keep_reading(p));
+                guard.defuse();
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut models = vec![async_model("(Off,cost:1),(Reading,*T*,cost:5)")];
+    let operations = operation::collect(&item, &models).unwrap();
+    operation::install(&operations, &mut models).unwrap();
+    let error = match checking::analyze_with_operations(&item, &models, &operations) {
+        Ok(_) => panic!("transient OnDrop fallback was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("restore"), "{error}");
+}
