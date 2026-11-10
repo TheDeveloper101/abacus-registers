@@ -90,6 +90,11 @@ pub(super) fn infer(
         structs: BTreeMap::new(),
         active: BTreeSet::new(),
         operations,
+        opaque_types: operations
+            .values()
+            .flat_map(|operation| operation.parameter_types.iter().cloned())
+            .filter(|name| models.iter().all(|model| model.registers != *name))
+            .collect(),
     };
     checker.collect(item, "")?;
     let names = checker.functions.keys().cloned().collect::<Vec<_>>();
@@ -106,6 +111,7 @@ struct Checker<'a> {
     structs: BTreeMap<String, BTreeMap<String, Type>>,
     active: BTreeSet<String>,
     operations: &'a BTreeMap<String, operation::Contract>,
+    opaque_types: BTreeSet<String>,
 }
 
 impl Checker<'_> {
@@ -193,7 +199,8 @@ impl Checker<'_> {
                 .iter()
                 .map(|argument| match argument {
                     FnArg::Typed(argument)
-                        if type_name(&argument.ty)? == self.models[operation.model].registers =>
+                        if type_name(&argument.ty)
+                            .is_ok_and(|name| name == self.models[operation.model].registers) =>
                     {
                         Ok(Value::Register(0))
                     }
@@ -304,6 +311,9 @@ impl Checker<'_> {
         if let Type::Reference(reference) = ty {
             return self.initial(&reference.elem, context);
         }
+        if matches!(ty, Type::Slice(_) | Type::Array(_)) {
+            return Ok(Value::Scalar);
+        }
         if let Type::Tuple(tuple) = ty {
             return Ok(Value::Tuple(
                 tuple
@@ -314,7 +324,7 @@ impl Checker<'_> {
             ));
         }
         let name = type_name(ty)?;
-        if is_scalar(&name) {
+        if is_scalar(&name) || self.opaque_types.contains(&name) {
             return Ok(Value::Scalar);
         }
         for (model_index, model) in self.models.iter().enumerate() {

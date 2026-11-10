@@ -589,7 +589,9 @@ impl Checker<'_> {
             .iter()
             .map(|argument| match argument {
                 FnArg::Typed(argument) => {
-                    if type_name(&argument.ty)? == self.models[operation.model].registers {
+                    if type_name(&argument.ty)
+                        .is_ok_and(|name| name == self.models[operation.model].registers)
+                    {
                         Ok(Value::Register(0))
                     } else {
                         Ok(Value::Scalar)
@@ -736,6 +738,9 @@ impl Checker<'_> {
     fn initial(&self, ty: &Type, context: &mut Context) -> Result<Value> {
         if let Type::Reference(r) = ty {
             return self.initial(&r.elem, context);
+        }
+        if matches!(ty, Type::Slice(_) | Type::Array(_)) {
+            return Ok(Value::Scalar);
         }
         if let Type::Tuple(tuple) = ty {
             return Ok(Value::Tuple(
