@@ -197,7 +197,7 @@ pub(super) fn install(
                 Operation {
                     target: contract.to.clone(),
                     cost: contract.cost.clone(),
-                    transition: false,
+                    transition: contract.from != contract.to,
                 },
             )
             .is_some()

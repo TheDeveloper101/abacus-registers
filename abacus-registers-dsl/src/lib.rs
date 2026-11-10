@@ -25,6 +25,7 @@ mod cost;
 mod generating;
 mod macro_input;
 mod parsing;
+mod rational;
 mod register;
 
 use proc_macro::TokenStream;

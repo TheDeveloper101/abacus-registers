@@ -5,7 +5,7 @@ use super::{
     model::Peripheral,
     operation,
 };
-use crate::parsing::Cost;
+use crate::{parsing::Cost, rational::Rational};
 use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use syn::{
@@ -62,6 +62,56 @@ struct Context {
     next_task: usize,
     guards: BTreeMap<usize, DropGuard>,
     next_guard: usize,
+    clock: ClockSet,
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum Clock {
+    Caller,
+    Fixed(Rational),
+}
+
+#[derive(Clone)]
+struct ClockSet(BTreeSet<Clock>);
+
+impl Default for ClockSet {
+    fn default() -> Self {
+        Self(BTreeSet::from([Clock::Caller]))
+    }
+}
+
+impl ClockSet {
+    fn fixed(speed: Rational) -> Self {
+        Self(BTreeSet::from([Clock::Fixed(speed)]))
+    }
+    fn resolve(&self) -> Rational {
+        self.0
+            .iter()
+            .map(|clock| match clock {
+                Clock::Caller => Rational::ONE,
+                Clock::Fixed(speed) => *speed,
+            })
+            .max()
+            .unwrap_or(Rational::ONE)
+    }
+    fn speeds(&self) -> impl Iterator<Item = Rational> + '_ {
+        self.0.iter().map(|clock| match clock {
+            Clock::Caller => Rational::ONE,
+            Clock::Fixed(speed) => *speed,
+        })
+    }
+    fn substitute(&self, caller: &Self) -> Self {
+        let mut result = BTreeSet::new();
+        for clock in &self.0 {
+            match clock {
+                Clock::Caller => result.extend(caller.0.iter().copied()),
+                fixed => {
+                    result.insert(*fixed);
+                }
+            }
+        }
+        Self(result)
+    }
 }
 
 #[derive(Clone)]
@@ -96,6 +146,14 @@ pub struct CommandSummary {
     pub background_steps: usize,
     pub events: Vec<PeripheralEvent>,
     pub span: proc_macro2::Span,
+    clock: ClockSet,
+    clock_change: Option<ClockChange>,
+}
+
+#[derive(Clone)]
+struct ClockChange {
+    default_cost: usize,
+    costs: BTreeMap<Rational, Cost>,
 }
 
 #[allow(dead_code)]
@@ -121,7 +179,7 @@ pub struct PeripheralEvent {
 }
 
 impl ControlFlowSummary {
-    pub fn cost(&self) -> usize {
+    pub fn raw_cost(&self) -> usize {
         match self {
             Self::Empty => 0,
             Self::Command(command) => {
@@ -133,10 +191,58 @@ impl ControlFlowSummary {
                             .map(|charge| charge.cost)
                             .sum::<usize>()
             }
-            Self::Sequence(parts) => parts.iter().map(Self::cost).sum(),
-            Self::Branch(arms) => arms.iter().map(Self::cost).max().unwrap_or(0),
-            Self::Scale(factor, summary) => factor * summary.cost(),
+            Self::Sequence(parts) => parts.iter().map(Self::raw_cost).sum(),
+            Self::Branch(arms) => arms.iter().map(Self::raw_cost).max().unwrap_or(0),
+            Self::Scale(factor, summary) => factor * summary.raw_cost(),
         }
+    }
+
+    pub fn cost(&self) -> usize {
+        self.raw_cost()
+    }
+
+    pub fn scaled_cost(&self) -> Rational {
+        match self {
+            Self::Empty => Rational::ONE.scale(0),
+            Self::Command(command) => {
+                let background = command.background_steps
+                    * command
+                        .background
+                        .iter()
+                        .map(|charge| charge.cost)
+                        .sum::<usize>();
+                command
+                    .clock
+                    .speeds()
+                    .map(|speed| speed.scale(command.adjusted_foreground(speed) + background))
+                    .max()
+                    .unwrap_or(Rational::ONE.scale(0))
+            }
+            Self::Sequence(parts) => parts.iter().fold(Rational::ONE.scale(0), |cost, part| {
+                cost.add(part.scaled_cost())
+            }),
+            Self::Branch(arms) => arms
+                .iter()
+                .map(Self::scaled_cost)
+                .max()
+                .unwrap_or(Rational::ONE.scale(0)),
+            Self::Scale(factor, summary) => summary.scaled_cost().multiply_usize(*factor),
+        }
+    }
+}
+
+impl CommandSummary {
+    pub(super) fn adjusted_foreground(&self, source: Rational) -> usize {
+        let Some(change) = &self.clock_change else {
+            return self.foreground;
+        };
+        self.foreground - change.default_cost + change.costs[&source].concrete().unwrap_or(0)
+    }
+    pub(super) fn speed(&self) -> Rational {
+        self.clock.resolve()
+    }
+    pub(super) fn scale_cost(&self, cost: usize) -> Rational {
+        self.speed().scale(cost)
     }
 }
 
@@ -148,7 +254,7 @@ enum CostExpression {
     Transition(String, String),
     Sum(Vec<CostExpression>),
     Maximum(Vec<CostExpression>),
-    Scaled(usize, Box<CostExpression>),
+    Scaled(Rational, Box<CostExpression>),
 }
 
 impl CostExpression {
@@ -260,6 +366,11 @@ fn event_cost(
             })
         }));
     }
+    if event.operation.starts_with("__heliod_operation::") {
+        return CostExpression::maximum(event.source.iter().map(|source| {
+            annotation(&model.operations[&(source.clone(), event.operation.clone())].cost)
+        }));
+    }
     if event.transition && model.states.values().any(|state| state.cost.is_symbolic()) {
         return CostExpression::maximum(event.source.iter().map(|source| {
             let target = &model.operations[&(source.clone(), event.operation.clone())].target;
@@ -278,26 +389,54 @@ fn symbolic_cost(
 ) -> CostExpression {
     match summary {
         ControlFlowSummary::Empty => CostExpression::Zero,
-        ControlFlowSummary::Command(command) => CostExpression::sum(
-            command
-                .events
-                .iter()
-                .map(|event| event_cost(event, devices, models))
-                .chain(command.background.iter().map(|charge| {
-                    let model = &models[devices[charge.device].model];
-                    let cost = CostExpression::maximum(
-                        charge
-                            .states
-                            .iter()
-                            .map(|state| annotation(&model.states[state].cost)),
-                    );
-                    if command.background_steps == 1 {
-                        cost
+        ControlFlowSummary::Command(command) => {
+            let unscaled = CostExpression::sum(
+                command
+                    .events
+                    .iter()
+                    .map(|event| event_cost(event, devices, models))
+                    .chain(command.background.iter().map(|charge| {
+                        let model = &models[devices[charge.device].model];
+                        let cost = CostExpression::maximum(
+                            charge
+                                .states
+                                .iter()
+                                .map(|state| annotation(&model.states[state].cost)),
+                        );
+                        if command.background_steps == 1 {
+                            cost
+                        } else {
+                            CostExpression::Scaled(
+                                Rational::ONE.scale(command.background_steps),
+                                Box::new(cost),
+                            )
+                        }
+                    })),
+            );
+            if command.clock_change.is_some() && command.clock.0.len() > 1 {
+                CostExpression::maximum(command.clock.speeds().map(|factor| {
+                    let cost = annotation(&command.clock_change.as_ref().unwrap().costs[&factor]);
+                    let expression = CostExpression::sum([unscaled.clone(), cost]);
+                    if factor == Rational::ONE {
+                        expression
                     } else {
-                        CostExpression::Scaled(command.background_steps, Box::new(cost))
+                        CostExpression::Scaled(factor, Box::new(expression))
                     }
-                })),
-        ),
+                }))
+            } else {
+                let factor = command.clock.resolve();
+                let expression = if let Some(change) = &command.clock_change {
+                    CostExpression::sum([unscaled, annotation(&change.costs[&factor])])
+                } else {
+                    unscaled
+                };
+                if factor == Rational::ONE {
+                    expression
+                } else {
+                    CostExpression::Scaled(factor, Box::new(expression))
+                }
+            }
+        }
         ControlFlowSummary::Sequence(parts) => CostExpression::sum(
             parts
                 .iter()
@@ -306,9 +445,10 @@ fn symbolic_cost(
         ControlFlowSummary::Branch(arms) => {
             CostExpression::maximum(arms.iter().map(|arm| symbolic_cost(arm, devices, models)))
         }
-        ControlFlowSummary::Scale(factor, summary) => {
-            CostExpression::Scaled(*factor, Box::new(symbolic_cost(summary, devices, models)))
-        }
+        ControlFlowSummary::Scale(factor, summary) => CostExpression::Scaled(
+            Rational::ONE.scale(*factor),
+            Box::new(symbolic_cost(summary, devices, models)),
+        ),
     }
 }
 
@@ -336,6 +476,7 @@ struct Evaluation {
     events: Vec<PeripheralEvent>,
     returned: bool,
     call_body_charged: bool,
+    clock_change: Option<ClockChange>,
 }
 impl Evaluation {
     fn new(value: Value, cost: usize) -> Self {
@@ -346,6 +487,7 @@ impl Evaluation {
             events: Vec::new(),
             returned: false,
             call_body_charged: false,
+            clock_change: None,
         }
     }
 }
@@ -363,6 +505,7 @@ pub(super) struct FunctionAnalysis {
     final_devices: Vec<Device>,
     result: Value,
     pub(super) summary: ControlFlowSummary,
+    final_clock: ClockSet,
 }
 pub struct Report {
     #[allow(dead_code)]
@@ -443,7 +586,16 @@ pub fn analyze_with_operations(
     }
     let reports = names
         .iter()
-        .map(|name| (name.clone(), checker.summaries[name].summary.cost()))
+        .map(|name| {
+            let summary = &checker.summaries[name].summary;
+            (
+                name.clone(),
+                summary
+                    .scaled_cost()
+                    .as_usize()
+                    .unwrap_or_else(|| summary.cost()),
+            )
+        })
         .collect();
     let reported_costs = names
         .iter()
@@ -452,7 +604,7 @@ pub fn analyze_with_operations(
             let cost = if models.iter().any(Peripheral::is_symbolic) {
                 symbolic_cost(&analysis.summary, &analysis.initial_devices, models).to_string()
             } else {
-                analysis.summary.cost().to_string()
+                analysis.summary.scaled_cost().to_string()
             };
             (name.clone(), cost)
         })
@@ -555,7 +707,7 @@ impl Checker<'_> {
                     function.body.span(),
                 )?;
             }
-            if evaluation.summary.cost() != evaluation.cost {
+            if evaluation.summary.raw_cost() != evaluation.cost {
                 return Err(Error::new(
                     function.body.span(),
                     "internal error: control-flow summary does not match the cost bound",
@@ -569,6 +721,7 @@ impl Checker<'_> {
                     final_devices: context.devices,
                     result: evaluation.value,
                     summary: evaluation.summary,
+                    final_clock: context.clock,
                 },
             );
             Ok(())
@@ -642,12 +795,14 @@ impl Checker<'_> {
                 operation: operation.operation.clone(),
                 source,
                 target,
-                transition: false,
+                transition: operation.from != operation.to,
                 cost,
                 source_inputs: BTreeSet::from([operation.from.clone()]),
                 span: function.signature.span(),
             }],
             span: function.signature.span(),
+            clock: ClockSet::default(),
+            clock_change: None,
         });
         self.summaries.insert(
             name.to_owned(),
@@ -657,6 +812,7 @@ impl Checker<'_> {
                 final_devices: vec![final_device],
                 result: Value::Scalar,
                 summary,
+                final_clock: ClockSet::default(),
             },
         );
         Ok(())
@@ -911,6 +1067,7 @@ impl Checker<'_> {
         let original = context.bindings.clone();
         let mut result = Evaluation::new(Value::Scalar, 0);
         for statement in &block.stmts {
+            let command_clock = context.clock.clone();
             let expression = match statement {
                 Stmt::Local(local) => local.init.as_ref().map(|init| init.expr.as_ref()),
                 Stmt::Expr(expression, _) => Some(expression),
@@ -970,7 +1127,7 @@ impl Checker<'_> {
                     ))
                 }
             };
-            let nested_cost = next.summary.cost();
+            let nested_cost = next.summary.raw_cost();
             let foreground = next.cost - nested_cost;
             let mut statement_parts = Vec::new();
             if has_outer_command && !next.call_body_charged {
@@ -981,6 +1138,8 @@ impl Checker<'_> {
                     background_steps: 1,
                     events: next.events,
                     span: statement.span(),
+                    clock: command_clock.clone(),
+                    clock_change: next.clock_change.clone(),
                 }));
             } else if foreground != 0 || !next.events.is_empty() {
                 statement_parts.push(ControlFlowSummary::Command(CommandSummary {
@@ -989,6 +1148,8 @@ impl Checker<'_> {
                     background_steps: 1,
                     events: next.events,
                     span: statement.span(),
+                    clock: command_clock,
+                    clock_change: next.clock_change.clone(),
                 }));
             }
             statement_parts.push(next.summary);
@@ -1009,11 +1170,12 @@ impl Checker<'_> {
         if let Expr::Block(block) = expr {
             return self.block(&block.block, context);
         }
+        let command_clock = context.clock.clone();
         let mut transitioning = BTreeSet::new();
         self.transitioning_devices(expr, context, &mut transitioning);
         let background = self.background_charges(context, &transitioning);
         let mut result = self.expression(expr, context)?;
-        let foreground = result.cost - result.summary.cost();
+        let foreground = result.cost - result.summary.raw_cost();
         let mut parts = Vec::new();
         if !result.call_body_charged {
             result.cost += background.iter().map(|charge| charge.cost).sum::<usize>();
@@ -1023,6 +1185,8 @@ impl Checker<'_> {
                 background_steps: 1,
                 events: std::mem::take(&mut result.events),
                 span: expr.span(),
+                clock: command_clock.clone(),
+                clock_change: result.clock_change.clone(),
             }));
         } else if foreground != 0 || !result.events.is_empty() {
             parts.push(ControlFlowSummary::Command(CommandSummary {
@@ -1031,6 +1195,8 @@ impl Checker<'_> {
                 background_steps: 1,
                 events: std::mem::take(&mut result.events),
                 span: expr.span(),
+                clock: command_clock,
+                clock_change: result.clock_change.clone(),
             }));
         }
         parts.push(std::mem::replace(
@@ -1215,6 +1381,7 @@ impl Checker<'_> {
             || before.captured != context.captured
             || before.tasks.keys().ne(context.tasks.keys())
             || before.guards.keys().ne(context.guards.keys())
+            || before.clock.0 != context.clock.0
         {
             return Err(Error::new(
                 span,
@@ -1223,7 +1390,7 @@ impl Checker<'_> {
         }
         self.per_iteration.insert(self.function.clone());
         let summary = iteration.summary;
-        let mut result = Evaluation::new(Value::Scalar, summary.cost());
+        let mut result = Evaluation::new(Value::Scalar, summary.raw_cost());
         result.summary = summary;
         result.call_body_charged = true;
         Ok(result)
@@ -1248,7 +1415,7 @@ impl Checker<'_> {
             iterations.push(iteration.summary);
         }
         let summary = sequence(iterations);
-        let mut result = Evaluation::new(Value::Scalar, summary.cost());
+        let mut result = Evaluation::new(Value::Scalar, summary.raw_cost());
         result.summary = summary;
         result.call_body_charged = true;
         Ok(result)
@@ -1289,6 +1456,53 @@ impl Checker<'_> {
         }
         if name == "heliod_await" {
             return self.await_timeout(call, context);
+        }
+        if name == "clock" {
+            if awaiting || call.args.len() != 1 {
+                return Err(Error::new(
+                    call.span(),
+                    "clock expects one positive rational speed",
+                ));
+            }
+            let target = rational_literal(&call.args[0])?;
+            let mut costs = BTreeMap::new();
+            for model in self.models {
+                for ((from, to), cost) in &model.clock_costs {
+                    if *to != target {
+                        continue;
+                    }
+                    if costs
+                        .insert(*from, cost.clone())
+                        .is_some_and(|old| old != *cost)
+                    {
+                        return Err(Error::new(
+                            call.span(),
+                            "conflicting clock costs across providers",
+                        ));
+                    }
+                }
+            }
+            for source in context.clock.speeds() {
+                if !costs.contains_key(&source) {
+                    return Err(Error::new(
+                        call.span(),
+                        format!("no clock cost is declared for ({source}, {target})"),
+                    ));
+                }
+            }
+            let default_cost = context
+                .clock
+                .speeds()
+                .map(|source| costs[&source].concrete().unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            context.clock = ClockSet::fixed(target);
+            let mut result = Evaluation::new(Value::Scalar, default_cost);
+            result.clock_change = Some(ClockChange {
+                default_cost,
+                costs,
+            });
+            return Ok(result);
         }
         let mut values = Vec::new();
         let mut cost = 0;
@@ -1443,12 +1657,14 @@ impl Checker<'_> {
             background_steps: 1,
             events: Vec::new(),
             span: call.span(),
+            clock: context.clock.clone(),
+            clock_change: None,
         });
-        let summary = sequence([
-            ControlFlowSummary::Scale(timeout, Box::new(tick)),
-            ControlFlowSummary::Branch(vec![normal.summary, fallback]),
+        let summary = ControlFlowSummary::Branch(vec![
+            normal.summary,
+            sequence([ControlFlowSummary::Scale(timeout, Box::new(tick)), fallback]),
         ]);
-        let mut result = Evaluation::new(Value::Scalar, summary.cost());
+        let mut result = Evaluation::new(Value::Scalar, summary.raw_cost());
         result.summary = summary;
         result.call_body_charged = true;
         Ok(result)
@@ -1619,6 +1835,8 @@ impl Checker<'_> {
             background_steps: 1,
             events: Vec::new(),
             span: call.args[1].span(),
+            clock: context.clock.clone(),
+            clock_change: None,
         });
         let timeout_summary = sequence([
             ControlFlowSummary::Scale(timeout, Box::new(timeout_tick)),
@@ -1632,7 +1850,7 @@ impl Checker<'_> {
         context.captured.remove(&task.device);
         context.tasks.remove(&task_id);
 
-        let mut result = Evaluation::new(Value::Scalar, summary.cost());
+        let mut result = Evaluation::new(Value::Scalar, summary.raw_cost());
         result.summary = summary;
         result.call_body_charged = true;
         Ok(result)
@@ -2105,6 +2323,7 @@ impl Checker<'_> {
         }
 
         let call_inputs = context.devices.clone();
+        let caller_clock = context.clock.clone();
         let summary =
             self.instantiate_control_flow(&function.summary, &mapped, context, &unique)?;
         for (formal, actual) in function.final_devices.iter().zip(&mapped) {
@@ -2122,8 +2341,9 @@ impl Checker<'_> {
                 .cloned()
                 .collect();
         }
+        context.clock = function.final_clock.substitute(&caller_clock);
         let value = map_result(&function.result, &mapped, span)?;
-        let cost = summary.cost();
+        let cost = summary.raw_cost();
         let mut result = Evaluation::new(value, cost);
         result.summary = summary;
         Ok(result)
@@ -2228,12 +2448,27 @@ impl Checker<'_> {
                         })
                     })
                     .collect::<Result<_>>()?;
+                let clock = command.clock.substitute(&context.clock);
+                if let Some(change) = &command.clock_change {
+                    for source in clock.speeds() {
+                        if !change.costs.contains_key(&source) {
+                            return Err(Error::new(
+                                command.span,
+                                format!("no clock cost is declared for caller speed {source}"),
+                            ));
+                        }
+                    }
+                }
                 ControlFlowSummary::Command(CommandSummary {
-                    foreground: events.iter().map(|event| event.cost).sum(),
+                    foreground: command.foreground
+                        - command.events.iter().map(|event| event.cost).sum::<usize>()
+                        + events.iter().map(|event| event.cost).sum::<usize>(),
                     background,
                     background_steps: command.background_steps,
                     events,
                     span: command.span,
+                    clock,
+                    clock_change: command.clock_change.clone(),
                 })
             }
             ControlFlowSummary::Sequence(parts) => ControlFlowSummary::Sequence(
@@ -2416,6 +2651,37 @@ fn integer_literal(expression: &Expr) -> Result<usize> {
     integer.base10_parse()
 }
 
+fn rational_literal(expression: &Expr) -> Result<Rational> {
+    let parse_integer = |expression: &Expr| -> Result<u128> {
+        let Expr::Lit(literal) = expression else {
+            return Err(Error::new(
+                expression.span(),
+                "clock speed must be a positive rational literal",
+            ));
+        };
+        let syn::Lit::Int(integer) = &literal.lit else {
+            return Err(Error::new(
+                expression.span(),
+                "clock speed must be a positive rational literal",
+            ));
+        };
+        integer.base10_parse()
+    };
+    let (numerator, denominator) = if let Expr::Binary(binary) = expression {
+        if !matches!(binary.op, syn::BinOp::Div(_)) {
+            return Err(Error::new(
+                expression.span(),
+                "clock speed must be written as `n` or `n / d`",
+            ));
+        }
+        (parse_integer(&binary.left)?, parse_integer(&binary.right)?)
+    } else {
+        (parse_integer(expression)?, 1)
+    };
+    Rational::new(numerator, denominator)
+        .ok_or_else(|| Error::new(expression.span(), "clock speed must be positive"))
+}
+
 fn call_path_name(call: &syn::ExprCall) -> Option<String> {
     let Expr::Path(path) = call.func.as_ref() else {
         return None;
@@ -2540,6 +2806,7 @@ fn join_context(left: &Context, right: &Context) -> Result<Context> {
         ]);
     }
     joined.next_task = left.next_task.max(right.next_task);
+    joined.clock.0.extend(right.clock.0.iter().copied());
     Ok(joined)
 }
 
@@ -2572,6 +2839,7 @@ fn join_result(left: Evaluation, right: Evaluation) -> Result<Evaluation> {
         events: Vec::new(),
         returned: left.returned,
         call_body_charged: false,
+        clock_change: None,
     })
 }
 fn type_name(ty: &Type) -> Result<String> {

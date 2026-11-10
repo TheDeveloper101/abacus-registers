@@ -23,6 +23,12 @@ macro_rules! heliod_ignore {
 }
 pub use tock_registers;
 
+/// Marks a system clock-speed change for Heliod's cost analysis.
+///
+/// The platform remains responsible for performing the actual hardware clock change.
+#[inline(always)]
+pub fn clock<T>(_speed: T) {}
+
 /// Trait denoting a register block and specifies
 /// the StateEnum associated type (wrapper enum for all
 /// states the peripheral can be in).

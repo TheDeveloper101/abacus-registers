@@ -10,7 +10,10 @@ use syn::{
 use std::collections::{hash_set::HashSet, HashMap};
 
 use crate::generating;
-use crate::parsing::{State, StateDefinition};
+use crate::{
+    parsing::{Cost, State, StateDefinition},
+    rational::Rational,
+};
 
 mod custom_keywords {
     syn::custom_keyword!(peripheral_name);
@@ -20,6 +23,7 @@ mod custom_keywords {
     syn::custom_keyword!(backend);
     syn::custom_keyword!(external);
     syn::custom_keyword!(transitions);
+    syn::custom_keyword!(clock_costs);
 }
 
 pub enum Backend {
@@ -37,6 +41,25 @@ pub struct MacroInput {
     pub backend: Backend,
     pub state_definitions: Vec<StateDefinition>,
     pub transitions: Vec<Transition>,
+    pub clock_costs: Vec<ClockCost>,
+}
+
+pub struct ClockCost {
+    pub from: Rational,
+    pub to: Rational,
+    pub cost: Cost,
+}
+
+fn rational(input: ParseStream) -> syn::Result<Rational> {
+    let numerator = input.parse::<syn::LitInt>()?.base10_parse::<u128>()?;
+    let denominator = if input.peek(Token![/]) {
+        input.parse::<Token![/]>()?;
+        input.parse::<syn::LitInt>()?.base10_parse::<u128>()?
+    } else {
+        1
+    };
+    Rational::new(numerator, denominator)
+        .ok_or_else(|| input.error("clock speeds must be positive rational numbers"))
 }
 
 impl MacroInput {
@@ -343,6 +366,35 @@ impl Parse for MacroInput {
             Vec::new()
         };
 
+        let clock_costs = if input.peek(custom_keywords::clock_costs) {
+            input.parse::<custom_keywords::clock_costs>()?;
+            input.parse::<Token![:]>()?;
+            let content;
+            bracketed!(content in input);
+            let entries = content.parse_terminated(
+                |entry| {
+                    let pair;
+                    syn::parenthesized!(pair in entry);
+                    let from = rational(&pair)?;
+                    pair.parse::<Token![,]>()?;
+                    let to = rational(&pair)?;
+                    if !pair.is_empty() {
+                        return Err(pair.error("expected `(from, to)`"));
+                    }
+                    entry.parse::<Token![:]>()?;
+                    let cost = entry.parse()?;
+                    Ok(ClockCost { from, to, cost })
+                },
+                Token![,],
+            )?;
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+            entries.into_iter().collect()
+        } else {
+            Vec::new()
+        };
+
         if !input.is_empty() {
             return Err(input.error("unexpected process_register_block option"));
         }
@@ -354,6 +406,7 @@ impl Parse for MacroInput {
             backend,
             state_definitions: state_definitions.into_iter().collect(),
             transitions,
+            clock_costs,
         })
     }
 }

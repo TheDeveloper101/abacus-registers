@@ -4,11 +4,12 @@ use super::{
     diagnostics::Diagnostic,
     model::Peripheral,
 };
+use crate::rational::Rational;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone)]
 struct Path {
-    cost: usize,
+    cost: Rational,
     operations: Vec<String>,
 }
 
@@ -16,7 +17,7 @@ struct Transition<'a> {
     source: &'a str,
     target: &'a str,
     operation: &'a str,
-    cost: usize,
+    cost: Rational,
 }
 
 pub fn analyze(
@@ -119,12 +120,13 @@ fn inspect_sequence(
 
         let middle = ControlFlowSummary::Sequence(parts[entry_end..exit_start].to_vec());
         let middle_uses_device = has_device_event(&middle, device);
-        let written = ControlFlowSummary::Sequence(parts[entry_start..exit_end].to_vec()).cost();
+        let written =
+            ControlFlowSummary::Sequence(parts[entry_start..exit_end].to_vec()).scaled_cost();
         let entry_other_background =
             other_background(command(&parts[entry_start]).unwrap(), device);
         let exit_other_background = other_background(command(&parts[exit_start]).unwrap(), device);
 
-        let mut best: Option<(String, Path, Path, usize)> = None;
+        let mut best: Option<(String, Path, Path, Rational)> = None;
         for (candidate, state) in &model.states {
             if state.transient {
                 continue;
@@ -135,12 +137,22 @@ fn inspect_sequence(
             if middle_uses_device && candidate != source {
                 continue;
             }
-            let Some(before) = shortest_path(model, source, candidate, entry_other_background)
-            else {
+            let Some(before) = shortest_path(
+                model,
+                source,
+                candidate,
+                command(&parts[entry_start]).unwrap().speed(),
+                entry_other_background,
+            ) else {
                 continue;
             };
-            let Some(after) = shortest_path(model, candidate, required, exit_other_background)
-            else {
+            let Some(after) = shortest_path(
+                model,
+                candidate,
+                required,
+                command(&parts[exit_start]).unwrap().speed(),
+                exit_other_background,
+            ) else {
                 continue;
             };
             let Some((middle_cost, middle_states)) =
@@ -246,8 +258,10 @@ fn inspect_transition_boundaries(
             let Some(next_command) = command(&parts[use_index]) else {
                 continue;
             };
-            let written = part.cost() + gap.cost();
-            let moved = boundary.cost + other_background(next_command, device) + alternative_gap;
+            let written = part.scaled_cost() + gap.scaled_cost();
+            let moved = next_command.scale_cost(boundary.cost)
+                + other_background(next_command, device)
+                + alternative_gap;
             if moved < written {
                 diagnostics.push(Diagnostic {
                     span: boundary.span,
@@ -284,9 +298,10 @@ fn inspect_transition_boundaries(
             let Some(first_gap_command) = first_command(&gap) else {
                 continue;
             };
-            let written = gap.cost() + part.cost();
-            let moved =
-                boundary.cost + other_background(first_gap_command, device) + alternative_gap;
+            let written = gap.scaled_cost() + part.scaled_cost();
+            let moved = first_gap_command.scale_cost(boundary.cost)
+                + other_background(first_gap_command, device)
+                + alternative_gap;
             if moved < written {
                 diagnostics.push(Diagnostic {
                     span: boundary.span,
@@ -373,11 +388,11 @@ fn alternative_cost(
     device: usize,
     model: &Peripheral,
     states: BTreeSet<String>,
-) -> Option<(usize, BTreeSet<String>)> {
+) -> Option<(Rational, BTreeSet<String>)> {
     match summary {
-        ControlFlowSummary::Empty => Some((0, states)),
+        ControlFlowSummary::Empty => Some((Rational::ONE.scale(0), states)),
         ControlFlowSummary::Command(command) => {
-            let mut foreground = command.foreground;
+            let mut foreground = command.adjusted_foreground(command.speed());
             let background_states = states.clone();
             let mut next = states;
             for event in command.events.iter().filter(|event| event.device == device) {
@@ -411,10 +426,10 @@ fn alternative_cost(
                     .filter_map(|state| model.states[state].cost.concrete())
                     .max()
                     .unwrap_or(0);
-            Some((foreground + background, next))
+            Some((command.scale_cost(foreground + background), next))
         }
         ControlFlowSummary::Sequence(parts) => {
-            let mut cost = 0;
+            let mut cost = Rational::ONE.scale(0);
             let mut current = states;
             for part in parts {
                 let (part_cost, output) = alternative_cost(part, device, model, current)?;
@@ -424,7 +439,7 @@ fn alternative_cost(
             Some((cost, current))
         }
         ControlFlowSummary::Branch(arms) => {
-            let mut cost = 0;
+            let mut cost = Rational::ONE.scale(0);
             let mut outputs = BTreeSet::new();
             for arm in arms {
                 let (arm_cost, output) = alternative_cost(arm, device, model, states.clone())?;
@@ -435,7 +450,7 @@ fn alternative_cost(
         }
         ControlFlowSummary::Scale(factor, summary) => {
             let (cost, output) = alternative_cost(summary, device, model, states)?;
-            Some((factor * cost, output))
+            Some((cost.multiply_usize(*factor), output))
         }
     }
 }
@@ -453,20 +468,23 @@ fn has_device_event(summary: &ControlFlowSummary, device: usize) -> bool {
     }
 }
 
-fn other_background(command: &CommandSummary, device: usize) -> usize {
-    command
-        .background
-        .iter()
-        .filter(|charge| charge.device != device)
-        .map(|charge| charge.cost)
-        .sum()
+fn other_background(command: &CommandSummary, device: usize) -> Rational {
+    command.scale_cost(
+        command
+            .background
+            .iter()
+            .filter(|charge| charge.device != device)
+            .map(|charge| charge.cost)
+            .sum(),
+    )
 }
 
 fn shortest_path(
     model: &Peripheral,
     source: &str,
     target: &str,
-    other_background: usize,
+    speed: Rational,
+    other_background: Rational,
 ) -> Option<Path> {
     let edges = model
         .operations
@@ -476,13 +494,13 @@ fn shortest_path(
             source,
             target: &operation.target,
             operation: name,
-            cost: operation.cost.concrete().unwrap() + other_background,
+            cost: speed.scale(operation.cost.concrete().unwrap()) + other_background,
         })
         .collect::<Vec<_>>();
     let mut paths = BTreeMap::from([(
         source.to_owned(),
         Path {
-            cost: 0,
+            cost: Rational::ONE.scale(0),
             operations: Vec::new(),
         },
     )]);

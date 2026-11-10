@@ -21,6 +21,13 @@ fn model(states: &str, registers: &str) -> syn::Result<Peripheral> {
     Peripheral::new(input, syn::parse_str(registers)?)
 }
 
+fn model_with_clocks(clock_costs: &str) -> syn::Result<Peripheral> {
+    let input: MacroInput = syn::parse_str(&format!(
+        "peripheral_name=\"Test\", register_base_addr=0, states=[{STATES}], clock_costs:[{clock_costs}]"
+    ))?;
+    Peripheral::new(input, syn::parse_str(REGISTERS)?)
+}
+
 fn parking_model(states: &str, ready_off: usize, off_idle: usize) -> Peripheral {
     model(
         states,
@@ -76,6 +83,71 @@ fn async_model(states: &str) -> Peripheral {
         }"#,
     )
     .unwrap()
+}
+
+#[test]
+fn clock_commands_scale_costs_and_charge_clock_transitions() {
+    let model = model_with_clocks("(1, 2): 4, (2, 1/2): 6").unwrap();
+    let source =
+        "fn f(p:TestRegisters<Off>){p.data.get();clock(2);p.data.get();clock(1/2);p.data.get();}";
+    let report = checking::analyze(&syn::parse_str(source).unwrap(), &[model]).unwrap();
+    assert_eq!(report.reported_costs[0].1, "59/2");
+}
+
+#[test]
+fn helper_cost_uses_the_callers_clock() {
+    let model = model_with_clocks("(1, 1/2): 2, (1, 2): 4, (1/2, 2): 8").unwrap();
+    let source = "mod api { fn helper(p:TestRegisters<Off>){p.data.get();clock(2);} fn main(p:TestRegisters<Off>){clock(1/2);helper(p);} }";
+    let report = checking::analyze(&syn::parse_str(source).unwrap(), &[model]).unwrap();
+    let main = report
+        .reported_costs
+        .iter()
+        .find(|(name, _)| name == "api::main")
+        .unwrap();
+    assert_eq!(main.1, "9");
+}
+
+#[test]
+fn symbolic_clock_change_costs_are_reported() {
+    let model = model_with_clocks("(1, 1/2): slow_clock").unwrap();
+    let source = "fn f(p:TestRegisters<Off>){clock(1/2);p.data.get();}";
+    let report = checking::analyze(&syn::parse_str(source).unwrap(), &[model]).unwrap();
+    let cost = &report.reported_costs[0].1;
+    assert!(cost.contains("slow_clock"), "{cost}");
+    assert!(cost.contains("1/2"), "{cost}");
+}
+
+#[test]
+fn burn_analysis_uses_scaled_costs_after_a_clock_change() {
+    let input: MacroInput = syn::parse_str(
+        "peripheral_name=\"Test\", register_base_addr=0, states=[(Off,cost:0),(On,cost:5)], clock_costs:[(1,2):0]"
+    ).unwrap();
+    let peripheral = Peripheral::new(
+        input,
+        syn::parse_str(&format!(
+            r#"struct Registers {{
+            #[RegAttributes([Off], StateChange(On, [Task::SET], on), cost = 1)]
+            on: WriteOnly<u32, Task::Register>,
+            #[RegAttributes([On], ReadOnly, cost = 0)]
+            data: ReadOnly<u32, Task::Register>,
+        }}"#
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let source = "fn f(p:TestRegisters<Off>){let p=p.into_on();clock(2);let x=1;p.data.get();}";
+    let report = checking::analyze(&syn::parse_str(source).unwrap(), &[peripheral]).unwrap();
+    assert!(
+        report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("enables TestRegisters too early")),
+        "{:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -1023,6 +1095,41 @@ fn opaque_operation_identity_is_preserved_across_branches() {
 }
 
 #[test]
+fn opaque_state_changes_are_visible_to_transition_boundary_analysis() {
+    let item = syn::parse_str(
+        r#"mod api {
+            #[heliod_operation(peripheral=TestCost,from=Off,to=On,cost=1)]
+            fn resume() { external_resume(); }
+            #[heliod_operation(peripheral=TestCost,from=On,to=On,cost=0)]
+            fn use_peripheral() { external_use(); }
+            fn independent() { let _work = 1; }
+            fn inefficient() {
+                resume();
+                independent();
+                use_peripheral();
+            }
+            fn optimized() {
+                independent();
+                resume();
+                use_peripheral();
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut models = vec![model(STATES, REGISTERS).unwrap()];
+    let operations = operation::collect(&item, &models).unwrap();
+    operation::install(&operations, &mut models).unwrap();
+    let report = checking::analyze_with_operations(&item, &models, &operations).unwrap();
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message.contains("enables") && diagnostic.message.contains("too early")
+    }));
+    assert!(report
+        .diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.message.contains("api::optimized")));
+}
+
+#[test]
 fn opaque_async_operations_charge_ambient_background_for_every_step() {
     let item = syn::parse_str(
         r#"mod api {
@@ -1203,10 +1310,17 @@ fn embassy_timeout_uses_on_drop_as_the_stable_fallback() {
     let operations = operation::collect(&item, &models).unwrap();
     operation::install(&operations, &mut models).unwrap();
     let report = checking::analyze_with_operations(&item, &models, &operations).unwrap();
-    assert!(report
-        .costs
-        .iter()
-        .any(|(name, cost)| name == "api::read" && *cost > 0));
+    // max(normal completion = 3, timeout ticks + fallback = 3 * 5 + 2) = 17.
+    // The remaining commands contribute 8, for a total of 25. The former
+    // adapter shape charged timeout ticks on the normal arm and produced 26.
+    assert!(
+        report
+            .costs
+            .iter()
+            .any(|(name, cost)| name == "api::read" && *cost == 25),
+        "{:?}",
+        report.costs
+    );
 }
 
 #[test]

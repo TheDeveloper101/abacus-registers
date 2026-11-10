@@ -1,3 +1,4 @@
+use crate::rational::Rational;
 use crate::{
     macro_input::MacroInput,
     parsing::{Cost, RegisterAttributes, RegisterType, State},
@@ -24,6 +25,7 @@ pub struct Peripheral {
     pub states: BTreeMap<String, StateInfo>,
     // (source state shortname, generated method name)
     pub operations: BTreeMap<(String, String), Operation>,
+    pub clock_costs: BTreeMap<(Rational, Rational), Cost>,
 }
 impl Peripheral {
     pub fn is_symbolic(&self) -> bool {
@@ -32,6 +34,7 @@ impl Peripheral {
                 .operations
                 .values()
                 .any(|operation| operation.cost.is_symbolic())
+            || self.clock_costs.values().any(Cost::is_symbolic)
     }
 
     pub fn new(input: MacroInput, item: DeriveInput) -> Result<Self> {
@@ -40,7 +43,17 @@ impl Peripheral {
             state_enum: format!("{}StateEnum", input.peripheral_name),
             states: BTreeMap::new(),
             operations: BTreeMap::new(),
+            clock_costs: BTreeMap::new(),
         };
+        for clock in input.clock_costs {
+            if model
+                .clock_costs
+                .insert((clock.from, clock.to), clock.cost)
+                .is_some()
+            {
+                return Err(Error::new(item.span(), "duplicate clock cost"));
+            }
+        }
         for state in &input.state_definitions {
             if state.state.contains_any() {
                 return Err(Error::new(

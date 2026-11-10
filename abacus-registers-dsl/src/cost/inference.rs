@@ -483,6 +483,12 @@ impl Checker<'_> {
         if name == "heliod_await" {
             return self.await_timeout(call, context);
         }
+        if name == "clock" {
+            if call.args.len() != 1 {
+                return Err(Error::new(call.span(), "clock expects one speed"));
+            }
+            return Ok(Value::Scalar);
+        }
         let values = call
             .args
             .iter()
